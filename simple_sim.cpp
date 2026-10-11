@@ -9,6 +9,8 @@
 #include <thread>
 #include <set>
 #include <queue>
+#include <iomanip>
+#include <algorithm>
 
 struct Position{    // Represents a position in the grid with x and y coordinates
     int x;
@@ -34,19 +36,109 @@ struct CompareNodes{    // Comparator for the priority queue used in A* algorith
     }
 };
 
+class TSDFMap{
+    private: 
+        int width;
+        int height;
+        double max_dist;
+
+        std::vector<std::vector<double>> tsdf_grid; // 2D grid representing the TSDF values for each cell in the environment
+        
+        const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
+        const int dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
+    public:
+        TSDFMap(int w, int h, double max_truncation_dist = 5.0) : width(w), height(h), max_dist(max_truncation_dist){
+            tsdf_grid = std::vector<std::vector<double>>(height, std::vector<double>(width, max_dist)); // Initialize the TSDF grid with the specified dimensions and set all values to max_dist
+        }
+
+        void updateTSDF(const std::vector<Position>& new_walls){
+            if (new_walls.empty()) return; // If there are no new walls to update, return early
+
+            using Element = std::pair<double, Position>; // Define a pair type to hold the distance and position for the priority queue
+            std::priority_queue<Element, std::vector<Element>, std::greater<Element>> pq; // Min-heap priority queue to process cells based on their distance to the nearest wall
+
+            for (const auto& wall : new_walls){
+                if (wall.x >= 0 && wall.x < width && wall.y >= 0 && wall.y < height){
+                    tsdf_grid[wall.y][wall.x] = 0.0; // Set the TSDF value of the wall cell to 0 (indicating a wall)
+                    pq.push({0.0, wall}); // Add the wall cell to the priority queue with a distance of 0
+                }
+            }
+
+            while (!pq.empty()){
+                auto [dist, pos] = pq.top(); // Get the cell with the smallest distance from the priority queue
+                pq.pop(); // Remove the cell from the priority queue
+
+                if (dist > tsdf_grid[pos.y][pos.x]) continue; // If the current distance is greater than the stored TSDF value, skip processing this cell
+
+                if (dist >= max_dist) continue; // If the distance exceeds the maximum truncation distance, skip processing this cell
+
+                for (int i = 0; i < 8; ++i){
+                    int nx = pos.x + dx[i]; // Calculate the x-coordinate of the neighboring cell
+                    int ny = pos.y + dy[i]; // Calculate the y-coordinate of the neighboring cell
+                    
+                    if (nx >= 0 && nx < width && ny >= 0 && ny < height){
+                        double step_cost = (dx[i] != 0 && dy[i] != 0) ? 1.414 : 1.0; // Calculate the step cost based on whether the movement is diagonal (1.414) or straight (1.0)
+                        double new_dist = dist + step_cost; // Calculate the distance to the neighboring cell
+                    
+                        if (new_dist < tsdf_grid[ny][nx]){
+                            tsdf_grid[ny][nx] = new_dist; // Update the TSDF value of the neighboring cell with the new distance
+                            pq.push({new_dist, {nx, ny}}); // Add the neighboring cell to the priority queue for further processing
+                        }
+                    }
+                }
+            }
+        }
+
+        double getTSDFValue(int x, int y) const{
+            if (x >= 0 && x < width && y >= 0 && y < height){
+                return tsdf_grid[y][x];
+            }
+            return -1.0; // Return -1.0 if the position is out of bounds
+        }
+
+        std::pair<double, double> getSafetyGradient(int x, int y) const{
+            if (x < 0 || x >= width || y < 0 || y >= height){
+                return {0.0, 0.0};
+            }
+
+            auto sample = [&](int sample_x, int sample_y){
+                sample_x = std::clamp(sample_x, 0, width - 1);
+                sample_y = std::clamp(sample_y, 0, height - 1);
+                return tsdf_grid[sample_y][sample_x];
+            };
+
+            double gradient_x = sample(x + 1, y) - sample(x - 1, y);
+            double gradient_y = sample(x, y + 1) - sample(x, y - 1);
+            double magnitude = std::hypot(gradient_x, gradient_y);
+
+            if (magnitude <= 1e-6){
+                return {0.0, 0.0};
+            }
+            return {gradient_x / magnitude, gradient_y / magnitude};
+        }
+
+        void TSDFToVisualiser(){
+            std::cout << "TSDF ";
+            for (int y = 0; y < height; ++y){
+                for (int x = 0; x < width; ++x){
+                    std::cout << std::fixed << std::setprecision(1) << tsdf_grid[y][x] << " ";
+                }
+            }
+            std::cout << "\n" << std::flush;
+        }
+
+};
+
 class Environment{  
     private:
         int width;
         int height;
+        int fov_radius;
 
         // FOV
-        // u-r; r; d-r; u-l; l; d-l; u; d
-        // const int dx[8] = {1, 1, 1, -1, -1, -1, 0, 0}; 
-        // const int dy[8] = {1, 0, -1, 1, 0, -1, 1, -1};
-
-        // 4-directional movement (right, down, left, up)
-        const int dx[4] = {1, 0, -1, 0};
-        const int dy[4] = {0, 1, 0, -1};
+        // 8-directional movement (E, SE, S, SW, W, NW, N, NE)
+        const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
+        const int dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
     public:
         int getWidth() const { return width; };
         int getHeight() const { return height; };
@@ -54,7 +146,7 @@ class Environment{
         std::vector<std::vector<int>>visits;
         std::set<Position> active_frontiers;   // Set of positions representing the active frontiers (unknown tiles) in the environment
         // -1...unknown, 0...known free, 1...known obstacle
-        Environment(int w, int h, int default_value) : width(w), height(h){ // Initialize the grid and visits matrices with the specified dimensions and default values
+        Environment(int w, int h, int default_value, int fov) : width(w), height(h), fov_radius(fov){ // Initialize the grid and visits matrices with the specified dimensions and default values
             grid = std::vector<std::vector<int>>(height, std::vector<int>(width, default_value));
             visits = std::vector<std::vector<int>>(height, std::vector<int>(width, 0));
         }
@@ -105,9 +197,10 @@ class Environment{
         }
 
         // Update the field of view (FOV) of the drone based on its current position and the true map
-        void updateFOV(int drone_x, int drone_y, std::vector<std::vector<int>>& true_map){  
+        std::vector<Position> updateFOV(int drone_x, int drone_y, std::vector<std::vector<int>>& true_map){  
+            std::vector<Position> new_walls; // Vector to store the positions of newly discovered walls (obstacles) in the FOV
             grid[drone_y][drone_x] = 0; // Mark the drone's current position as known free space (0) in the grid
-            int radius = 4; // Define the radius of the field of view (FOV) around the drone's position
+            int radius = fov_radius; // Define the radius of the field of view (FOV) around the drone's position
             int radius_squared = radius * radius; // Calculate the square of the radius for distance comparison
 
             // Update the 3x3 area around the drone's position to reflect the true map
@@ -122,11 +215,15 @@ class Environment{
 
                     if (view_x >= 0 && view_x < width && view_y >= 0 && view_y < height){ // Check if the calculated coordinates are within the bounds of the grid
                         if (hasLineOfSight(drone_x, drone_y, view_x, view_y, true_map)){ // Check if there is a clear line of sight between the drone's position and the cell in the FOV, considering obstacles in the true map
+                            if (grid[view_y][view_x] == -1 && true_map[view_y][view_x] == 1){ // If the cell in the grid is unknown (-1) and the corresponding cell in the true map is an obstacle (1)
+                                new_walls.push_back({view_x, view_y}); // Add the position of the newly discovered wall (obstacle) to the new_walls vector
+                            }
                             grid[view_y][view_x] = true_map[view_y][view_x]; // Update the cell in the grid to reflect the corresponding value from the true map (0 for free space, 1 for obstacle) if there is a clear line of sight
                         }
                     }   
                 }
             }
+            return new_walls; // Return the list of newly discovered walls (obstacles) in the FOV
         }
 
         // Check if the specified position (x, y) is safe for the drone to move to (within bounds and not an obstacle)
@@ -144,14 +241,20 @@ class Environment{
         }
 
         // Get a list of legal moves (positions) the drone can move to from its current position (current_x, current_y)
-        std::vector <Position> getLegalMoves(int current_x, int current_y, bool require_known = false){
+        std::vector <Position> getLegalMoves(int current_x, int current_y, bool require_known, const TSDFMap& tsdf){
             std::vector <Position> legal_moves;
-            for (int i = 0; i < 4; ++i){
+            for (int i = 0; i < 8; ++i){
                 int next_x = current_x + dx[i];
                 int next_y = current_y + dy[i];
 
                 // Check if the next position is safe (within bounds and not an obstacle) and add it to the list of legal moves
                 if (isSafe(next_x, next_y, require_known)){
+                    //if (tsdf.getTSDFValue(next_x, next_y) > 0.0 && tsdf.getTSDFValue(next_x, next_y) < 1.0){
+                    //    continue;   // Skip moves that lead to cells with TSDF values indicating proximity to obstacles
+                    //}
+                    if (!isSafe(next_x, current_y, require_known) && !isSafe(current_x, next_y, require_known)){
+                        continue;   // Skip diagonal moves if both adjacent horizontal and vertical cells are obstacles
+                    }
                     legal_moves.push_back({next_x, next_y});    
                 }
             }
@@ -161,10 +264,10 @@ class Environment{
         // Explore the field of view (FOV) of the drone at its current position (drone_x, drone_y) and return the number of newly discovered tiles
         int exploreFOV(int drone_x, int drone_y){
             int newly_discovered = 0;   // Count of newly discovered tiles in the FOV
-            int radius = 4; // Define the radius of the field of view (FOV) around the drone's position
+            int radius = fov_radius; // Define the radius of the field of view (FOV) around the drone's position
             int radius_squared = radius * radius; // Calculate the square of the radius for distance comparison
 
-            // Check the 3x3 area around the drone's position to see if any unknown tiles (-1) are discovered
+            // Check the FOV area around the drone's position to see if any unknown tiles (-1) are discovered
             for (int dy = -radius; dy <= radius; ++dy){
                 for (int dx = -radius; dx <= radius; ++dx){
                     if (dx * dx + dy * dy > radius_squared){ // Skip cells that are outside the circular FOV radius
@@ -190,7 +293,8 @@ class Environment{
 
         // Fill isolated -1 artifacts left by Bresenham raycaster gaps
         // Detects 1x1 -1 tiles completely surrounded by 0s and fills them
-        void fillFOVHoles(int center_x, int center_y, int radius = 4){
+        void fillFOVHoles(int center_x, int center_y){
+            int radius = fov_radius; // Define the radius of the field of view (FOV) around the drone's position
             int radius_squared = radius * radius;
             
             for (int dy = -radius; dy <= radius; ++dy){
@@ -247,7 +351,7 @@ class Environment{
 
         // Check if the entire environment has been fully explored
         // Only returns true if all REACHABLE -1 tiles are gone (ignores walled-off regions)
-        bool isFullyExplored(){
+        bool isFullyExplored(int start_x, int start_y, const TSDFMap& tsdf){
             // Quick scan: any -1 at all?
             bool has_unknown = false;
             for (int y = 0; y < height; ++y){
@@ -269,46 +373,31 @@ class Environment{
             std::vector<std::vector<bool>> visited(height, std::vector<bool>(width, false));
             
             // Seed BFS with all known free tiles
-            for (int y = 0; y < height; ++y){
-                for (int x = 0; x < width; ++x){
-                    if (grid[y][x] == 0){
-                        frontier_q.push({x, y});
-                        visited[y][x] = true;
-                    }
-                }
-            }
+            frontier_q.push({start_x, start_y});
+            visited[start_y][start_x] = true;
+        
             
             // BFS to find if any -1 is reachable
             while (!frontier_q.empty()){
                 Position current = frontier_q.front();
                 frontier_q.pop();
                 
-                int offset[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-                for (int i = 0; i < 4; ++i){
-                    int nx = current.x + offset[i][0];
-                    int ny = current.y + offset[i][1];
-                    
-                    if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-                    if (visited[ny][nx]) continue;
-                    
-                    visited[ny][nx] = true;
-                    
-                    // Found a reachable unknown tile = not fully explored
-                    if (grid[ny][nx] == -1){
-                        return false;
+                std::vector<Position> moves = getLegalMoves(current.x, current.y, false, tsdf);
+
+                for (const auto& move : moves){
+                    if (visited[move.y][move.x]) continue; // Already visited
+                    visited[move.y][move.x] = true; // Mark as visited
+                    if (grid[move.y][move.x] == -1){
+                        return false; // Found a reachable unknown tile, not fully explored
                     }
-                    
-                    // Continue BFS through known free space
-                    if (grid[ny][nx] == 0){
-                        frontier_q.push({nx, ny});
+                    if (grid[move.y][move.x] == 0){ // Only enqueue known free space for further exploration
+                        frontier_q.push(move);
                     }
                 }
             }
-            
             // All reachable space is explored (unreachable -1s are ignored)
             return true;
         }
-
 
         Position current_target = {-1, -1};   // Current target position for the drone to move towards (initialized to an invalid position)
         void updateTargetLock(int drone_x, int drone_y){
@@ -325,11 +414,13 @@ class Environment{
             if (grid[y][x] != 0){
                 return false;   // If the tile is not known free space (0), it cannot be a frontier
             }
-            int offset[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}}; // Define the offsets for the four neighboring tiles (right, left, down, up)
-
+        
+            const int frontier_dx[4] = {1, -1, 0, 0};
+            const int frontier_dy[4] = {0, 0, 1, -1};
+            
             for (int i = 0; i < 4; ++i){
-                int nx = x + offset[i][0]; // Calculate the x-coordinate of the neighboring tile
-                int ny = y + offset[i][1]; // Calculate the y-coordinate of the neighboring tile
+                int nx = x + frontier_dx[i]; // Calculate the x-coordinate of the neighboring tile
+                int ny = y + frontier_dy[i]; // Calculate the y-coordinate of the neighboring tile
                 if (nx >= 0 && nx < width && ny >= 0 && ny < height){
                     if (grid[ny][nx] == -1){
                         return true;    // If any neighboring tile is unknown (-1), the current tile is a frontier
@@ -339,7 +430,8 @@ class Environment{
             return false;   // If no neighboring tile is unknown, the current tile is not a frontier
         }
 
-        void updateFrontiersLocal(int center_x, int center_y, int radius = 4){
+        void updateFrontiersLocal(int center_x, int center_y){
+            int radius = fov_radius;
             int check_radius = radius + 1;
             int check_radius_squared = check_radius * check_radius;
 
@@ -366,8 +458,8 @@ class Environment{
             Position best_target = {-1, -1};
             int min_cost = 99999;
             double dist_weight = 1.0;
-            double info_gain_weight = 1.5;
-            double hysteresis = 5.0;
+            double info_gain_weight = 0.9;
+            double hysteresis = 15.0;
 
             for (const auto& frontier : active_frontiers){
                 int distance = std::abs(start.x - frontier.x) + std::abs(start.y - frontier.y);
@@ -381,7 +473,8 @@ class Environment{
             return best_target;
         }
 
-        int getInformationGain(Position frontier, int radius = 4){
+        int getInformationGain(Position frontier){
+            int radius = fov_radius;
             int unknown_count = 0;
             int radius_squared = radius * radius;
 
@@ -413,6 +506,16 @@ class Environment{
             }
             return true;    // If no frontiers are found within the threshold radius, the MCTS is considered bored
         }
+
+        bool isSurrounded(int drone_x, int drone_y, const TSDFMap& tsdf){
+            std::vector<Position> moves = getLegalMoves(drone_x, drone_y, true, tsdf);   // Get the list of legal moves (positions) the drone can move to from its current position
+            for (const auto& move : moves){
+                if (visits[move.y][move.x] == 0){   // If any of the legal moves lead to an unvisited tile (visits count is 0), the drone is not considered surrounded
+                    return false;   // Return false indicating that there are unvisited tiles available for exploration
+                }
+            }
+            return true;    // If all legal moves lead to visited tiles, the drone is considered surrounded
+        }
 };
 
 // Monte Carlo Tree Search (MCTS) Node structure
@@ -429,6 +532,19 @@ struct MCTSNode{
     MCTSNode(Position current_pos, MCTSNode* parent_node = nullptr, double h_bonus = 0.0)
     : visits(0.0), score(0.0), state(current_pos), parent(parent_node), heuristic_bonus(h_bonus) {}
 
+    // Add new root
+    std::unique_ptr<MCTSNode> extractChild(Position next_pos){
+        for (auto it = children.begin(); it != children.end(); ++it){ // Iterate through the child nodes of the current node to find a child with the specified next position
+            if ((*it)->state == next_pos){ // If a child node with the specified next position is found, extract it as the new root of the MCTS tree
+                std::unique_ptr<MCTSNode> new_root = std::move(*it); // Move the child node to a new unique pointer, effectively transferring ownership of the child node to the new root
+                children.erase(it); // Remove the extracted child node from the current node's list of children, as it is now the new root of the MCTS tree
+                new_root->parent = nullptr; // Set the parent of the new root node to nullptr, indicating that it is now the root of the MCTS tree
+                return new_root;
+            }
+        }
+        return nullptr;
+    }
+
     // Calculate the Upper Confidence Bound for Trees (UCT) score for this node, which balances exploration and exploitation
     double getUCTScore(double Cp = 1.414){   // Cp is the exploration parameter that controls the balance between exploration and exploitation (higher = more exploration)
         if (visits < 0.0001){   // If the node has not been visited yet, return infinity to prioritize exploration
@@ -441,7 +557,8 @@ struct MCTSNode{
 
         double exploration = 2.0 * Cp * std::sqrt(std::log(parent->visits) / visits);   // Calculate the exploration term based on the number of visits to the parent node and this node, encouraging exploration of less-visited nodes
 
-        return exploitation + exploration + heuristic_bonus;  // Return the combined UCT score, which is a balance between exploitation (average reward) and exploration (uncertainty based on visits)
+        double decaying_heuristic = heuristic_bonus / (1.0 + visits);   // Calculate a decaying heuristic bonus that decreases as the node is visited more often, encouraging exploration of nodes with higher heuristic values
+        return exploitation + exploration + decaying_heuristic;  // Return the combined UCT score, which is a balance between exploitation (average reward) and exploration (uncertainty based on visits)
     }
 
     // Backpropagate the simulation reward up the tree
@@ -461,67 +578,84 @@ struct MCTSNode{
         }
     }
 
-    MCTSNode* getBestChild(){   // Get the child node with the highest UCT score, which represents the most promising move based on the simulations
+    MCTSNode* getBestChild(Environment& map){   // Get the child node with the highest UCT score, which represents the most promising move based on the simulations
         MCTSNode* best_node = nullptr;  // Initialize a pointer to keep track of the child node with the best UCT score
+        double best_score = -std::numeric_limits<double>::infinity();  // Initialize the best score to negative infinity to ensure that any valid child node will have a higher score
 
-        double best_score = -999999.0;  // Initialize the best score to a very low value to ensure that any valid child node will have a higher score
+        for (const auto& child : children){  // Iterate through all child nodes of the current node to evaluate their UCT scores
+            const Position& position = child->state;  // Get the position represented by the current child node
 
-        for (int i = 0; i < children.size(); i++){  // Iterate through all child nodes of the current node to evaluate their UCT scores
-            double current_score = children[i]->getUCTScore();  // Calculate the UCT score for the current child node
+            if (map.grid[position.y][position.x] == 1 || map.visits[position.y][position.x] > 0){
+                continue;   // Skip child nodes that are obstacles (1) or have already been visited (visits count is greater than 0), as they are not considered for selection
+            }
+            
+            double score = child->getUCTScore();  // Calculate the UCT score for the current child node
 
-            if (current_score > best_score){    // If the current child's UCT score is better than the best score found so far, update the best score and best node
-                best_score = current_score; 
-                best_node = children[i].get();  // Update the best_node pointer to point to the current child node, which has the highest UCT score among the evaluated children
+            if (score > best_score){    // If the current child's UCT score is better than the best score found so far, update the best score and best node
+                best_score = score; 
+                best_node = child.get();  // Update the best_node pointer to point to the current child node, which has the highest UCT score among the evaluated children
             }
         } 
         return best_node;   // Return the child node with the highest UCT score, which is considered the best move based on the simulations performed in the MCTS algorithm
     }
     
     // Get the child node with the highest average score (reward) among the children that have been visited at least once
-    MCTSNode* getBestRealChild(Environment& map, Position prev_pos){   // Get the child node with the highest average score (reward) among the children that have been visited at least once
+    MCTSNode* getBestRealChild(Environment& map, const TSDFMap& tsdf, Position prev_pos, const std::vector<Position>& planned_path = {}){   // Select the highest-value child while avoiding low-clearance cells
         MCTSNode* best_node = nullptr; 
-        double best_avg_score = -9999999.0;
+        double best_selection_score = -std::numeric_limits<double>::infinity();
 
-        // Calculate the heading vector from the previous position to the current node's position
-        int heading_x = state.x - prev_pos.x;   // Calculate the x-component of the heading vector from the previous position to the current node's position
-        int heading_y = state.y - prev_pos.y;   // Calculate the y-component of the heading vector from the previous position to the current node's position
+        for (const auto& child : children){
+            const Position& position = child->state;
 
-        // Iterate through all child nodes to find the one with the highest average score (score divided by visits)
-        for (int i = 0; i < children.size(); ++i){
-            if (children[i]->visits > 0){   // Only consider child nodes that have been visited at least once to avoid division by zero and ensure meaningful average scores
-                double avg_score = children[i]->score / children[i]->visits;    // Calculate the average score for the current child node by dividing its cumulative score by the number of visits
-                
-                int current_x = children[i]->state.x;   // Get the x-coordinate of the current child node's position
-                int current_y = children[i]->state.y;   // Get the y-coordinate of the current child node's position
+            if (map.grid[position.y][position.x] == 1 || map.visits[position.y][position.x] > 0 || position == prev_pos){
+                continue;   // Skip child nodes that are obstacles (1) or have already been visited (visits count is greater than 0), as they are not considered for selection
+            }
 
-                int child_heading_x = current_x - state.x;   // Calculate the x-component of the heading vector from the current node's position to the child node's position
-                int child_heading_y = current_y - state.y;   // Calculate the y-component of the heading vector from the current node's position to the child node's position
-
-                if (current_x == prev_pos.x && current_y == prev_pos.y){
-                    avg_score -= 9999.0;   // Apply a penalty to the average score for moving back to the previous position, discouraging backtracking and promoting exploration of new areas
-                }else if (map.visits[current_y][current_x] > 0){
-                    avg_score -= 500.0;    // Apply a penalty to the average score for moving to a position that has already been visited, discouraging revisiting and promoting exploration of new areas
-                }else if (heading_x == child_heading_x && heading_y == child_heading_y){ // If the heading direction from the previous position to the current node is the same as the heading direction from the current node to the child node
-                    avg_score += 0.5;  // Apply a small bonus to the average score for moving in the same direction as the previous heading, encouraging the drone to continue exploring in a consistent direction
+            bool already_planned = false;   // Flag to check if the child node's position is already part of the planned path
+            for (const auto& planned : planned_path){
+                if (planned == position){
+                    already_planned = true;   // If the child node's position is found in the planned path, set the flag to true
+                    break;
                 }
+            }
 
-                if (avg_score > best_avg_score){    // If the current child's average score is better than the best average score found so far, update the best average score and best node
-                    best_avg_score = avg_score;
-                    best_node = children[i].get();
-                }
+            if (already_planned){
+                continue;   // Skip child nodes that are already part of the planned path or are the previous position, as they are not considered for selection
+            }
+
+            double avg_score = (child->visits > 0.0) ? child->score / child->visits : 0.0;
+            double clearance = tsdf.getTSDFValue(position.x, position.y);
+            double clearance_penalty = 0.0;
+            constexpr double preferred_clearance = 2.5;
+            if (clearance >= 0.0 && clearance < preferred_clearance){
+                double deficit = preferred_clearance - clearance;
+                clearance_penalty = 100.0 * deficit * deficit;
+            }
+            double clearance_bonus = 8.0 * std::min(clearance, 5.0);
+            double selection_score = avg_score + clearance_bonus - clearance_penalty;
+
+            if (best_node == nullptr || selection_score > best_selection_score){
+                best_node = child.get();
+                best_selection_score = selection_score;
             }
         }
         return best_node;   // Return the child node with the highest average score, which represents the most promising move based on the actual outcomes of simulations that have visited this node
     }
 
     // Expand the current node by generating child nodes for all legal moves from the current position in the environment
-    void expandNode(Environment& map){
+    void expandNode(Environment& map, const TSDFMap& tsdf){
         int current_x = state.x;
         int current_y = state.y;
 
-        std::vector<Position> possible_moves = map.getLegalMoves(current_x, current_y, true);
+        std::vector<Position> possible_moves = map.getLegalMoves(current_x, current_y, true, tsdf);   // Get the list of legal moves (positions) the drone can move to from its current position, considering known free space and TSDF values
 
         for (int i = 0; i < possible_moves.size(); i++){
+            
+            // If the possible move leads to a tile that has already been visited, skip it
+            if (map.visits[possible_moves[i].y][possible_moves[i].x] > 0){
+                continue;   // Skip moves that lead to already visited tiles (visits count is greater than 0), as they are not considered for expansion
+            }
+
             int distance_to_frontier = 99999;   // Initialize the distance to the nearest frontier (unknown tile) to a large value
             
             if (map.current_target.x != -1){
@@ -538,26 +672,27 @@ struct MCTSNode{
 };
 
 // Simulate the drone's movement and exploration in the environment starting from the given node for a maximum number of steps
-double simulateActivePerception(MCTSNode* start_node, Environment current_map, int max_steps){
+double simulateActivePerception(MCTSNode* start_node, Environment current_map, int max_steps, const TSDFMap& tsdf, std::mt19937& gen, int incoming_dx, int incoming_dy){
+    if (start_node == nullptr){
+       return -99999.0; // Return a negative reward if the starting node is null, indicating that the simulation cannot proceed
+    }
+
     int sim_x = start_node->state.x;    // Initialize the simulated x-coordinate of the drone's position to the x-coordinate of the starting node's state
     int sim_y = start_node->state.y;    // Initialize the simulated y-coordinate of the drone's position to the y-coordinate of the starting node's state
     
     if (current_map.visits[sim_y][sim_x] > 0){ // If the drone revisits a tile, apply a penalty to the total reward to discourage revisiting
-        return -500; // Return a negative reward to indicate that the simulation is not favorable due to revisiting a tile
+        return -99999.0; // Return a negative reward to indicate that the simulation is not favorable due to revisiting a tile
     }
 
     double total_reward = 0.0;  // Initialize the total reward accumulated during the simulation to zero
-    double step_reward = 0.0;   // Initialize the reward for the current step to zero
     
-    int prev_dx = 0;    // Initialize the previous x-direction of movement to zero (no movement yet)
-    int prev_dy = 0;    // Initialize the previous y-direction of movement to zero (no movement yet)
-
-    std::random_device rd;  // Create a random device to seed the random number generator for stochastic behavior in the simulation
-    std::mt19937 gen(rd()); // Initialize a Mersenne Twister random number generator with the seed from the random device
+    int prev_dx = incoming_dx;    // Initialize the previous x-direction of movement to zero (no movement yet)
+    int prev_dy = incoming_dy;    // Initialize the previous y-direction of movement to zero (no movement yet)
 
     // Simulate the drone's movement for a maximum number of steps
     for (int step = 0; step < max_steps; step++){
-        std::vector<Position> legal_moves = current_map.getLegalMoves(sim_x, sim_y, true);    // Get legal moves from the current position
+        double step_reward = 0.0;   // Initialize the reward for the current step to zero
+        std::vector<Position> legal_moves = current_map.getLegalMoves(sim_x, sim_y, true, tsdf);    // Get legal moves from the current position
 
         if (legal_moves.empty()){   // If there are no legal moves available, break the simulation loop as the drone is stuck
             break;
@@ -573,7 +708,9 @@ double simulateActivePerception(MCTSNode* start_node, Environment current_map, i
             int move_dy = move.y - sim_y;   // Calculate the y-direction of the move relative to the current position
 
             if (move_dx == prev_dx && move_dy == prev_dy){
-                weight += 3.0;  // Increase weight for moves that continue in the same direction as the previous move, encouraging the drone to maintain its heading and explore in a consistent direction
+                weight += 15.0;  // Increase weight for moves that continue in the same direction as the previous move, encouraging the drone to maintain its heading and explore in a consistent direction
+            } else {
+                weight *=0.75;   // Decrease weight for moves that change direction, discouraging frequent changes in direction and promoting smoother exploration paths
             }
 
             // Encourage the drone to move towards unknown areas
@@ -594,21 +731,19 @@ double simulateActivePerception(MCTSNode* start_node, Environment current_map, i
                 }
             }
 
-            int proximity_penalty = 0;
-            for (int dy = -3; dy <= 3; ++dy){
-                for (int dx = -3; dx <= 3; ++dx){
-                    int check_x = move.x + dx;
-                    int check_y = move.y + dy;
-                    if (check_x >= 0 && check_x < current_map.getWidth() && check_y >= 0 && check_y < current_map.getHeight()){
-                        if (current_map.visits[check_y][check_x] > 0){
-                            proximity_penalty++; // Count the number of visited cells within a 3-cell radius to apply a penalty for moving near previously
-                        }
-                    }
-                }
-            }
-            if (proximity_penalty > 0){
-                weight /= (1.0 + (proximity_penalty * 10.0)); // Apply a penalty to the weight for moves that are near previously visited cells, discouraging revisiting and promoting exploration of new areas
-            }
+            auto [gradient_x, gradient_y] = tsdf.getSafetyGradient(sim_x, sim_y);
+
+            double move_length = std::sqrt(move_dx * move_dx + move_dy * move_dy);
+
+            double alignment = (move_dx * gradient_x + move_dy * gradient_y) / (move_length + 1e-6); // Calculate the alignment of the move direction with the TSDF gradient direction
+
+            double gradient_factor = std::clamp(std::exp(1.0 * alignment), 0.1, 5.0); // Calculate a factor based on the alignment of the move direction with the TSDF gradient direction, encouraging moves that align with the gradient
+
+            weight *= gradient_factor; // Adjust the weight of the move based on its alignment with the TSDF gradient, promoting exploration in directions that lead to safer or more informative areas
+
+            double destination_clearance = tsdf.getTSDFValue(move.x, move.y);
+            double clearance_factor = std::clamp(destination_clearance / 2.5, 0.25, 2.5);
+            weight *= clearance_factor * clearance_factor;
             
             //weight *= (1.0 + (unknown_count * 5.0)); // Increase weight for moves that lead to more unknown cells
             move_weights.push_back(weight);
@@ -626,25 +761,21 @@ double simulateActivePerception(MCTSNode* start_node, Environment current_map, i
         sim_y = legal_moves[choice].y;
 
         if (current_map.visits[sim_y][sim_x] > 0){ // If the drone revisits a tile, apply a penalty to the total reward to discourage revisiting
-            total_reward -= 500.0;
+            total_reward -= 99999.0;
             break;  // Break the simulation loop to avoid further penalties and encourage exploration of new areas
         }
 
         current_map.visits[sim_y][sim_x] += 1; // Increment the visit count for the new position to track how many times it has been visited during the simulation
 
         double step_tentative_penalty = 0.0; // Initialize a tentative penalty for the current step to zero
-        for (int dy = -3; dy <= 3; dy++){
-            for (int dx = -3; dx <= 3; dx++){
-                int check_x = sim_x + dx;
-                int check_y = sim_y + dy;
-                if (check_x >= 0 && check_x < current_map.getWidth() && check_y >= 0 && check_y < current_map.getHeight()){
-                    if (dx != 0 || dy != 0){ // Exclude the current position from the penalty check
-                        if (current_map.visits[check_y][check_x] > 0){
-                            step_tentative_penalty += 1.0;
-                        }
-                    }
-                }
-            }
+
+        double tsdf_val = tsdf.getTSDFValue(sim_x, sim_y);
+        if (tsdf_val <= 0.01){
+            step_reward -= 99999.0;
+            break;
+        } else if (tsdf_val < 2.5){
+            double clearance_deficit = 2.5 - tsdf_val;
+            step_tentative_penalty += clearance_deficit * clearance_deficit * 300.0; // Penalize entering the preferred wall buffer
         }
 
         // Explore the FOV and accumulate the reward
@@ -655,7 +786,7 @@ double simulateActivePerception(MCTSNode* start_node, Environment current_map, i
         step_reward += (new_tiles * 20.0); // reward for discovering new tiles
         step_reward -= 1.0; // small penalty for each step to encourage shorter paths
 
-        step_reward -= (step_tentative_penalty * 10.0); // penalty for being near previously visited tiles
+        step_reward -= (step_tentative_penalty); // penalty for being near previously visited tiles
     
         double gamma = 0.9; // discount factor for future rewards
         total_reward += (step_reward * std::pow(gamma, step));
@@ -687,10 +818,11 @@ std::vector<std::vector<int>> generateTrueMap (int width, int height, int num_ob
     return true_map;
 }
 
-MCTSNode* selectNode(MCTSNode* root){   // Select a node to expand based on the UCT score
+MCTSNode* selectNode(MCTSNode* root, Environment& map){   // Select a node to expand based on the UCT score
     MCTSNode* current = root;   // Start from the root node
+    
     while(!current->children.empty()){  // While the current node has children, continue traversing down the tree
-        MCTSNode* next = current->getBestChild();   // Get the child node with the best UCT score
+        MCTSNode* next = current->getBestChild(map);   // Get the child node with the best UCT score
         if (next == nullptr){   // If there are no valid children, break the loop
             break;
         }
@@ -700,11 +832,13 @@ MCTSNode* selectNode(MCTSNode* root){   // Select a node to expand based on the 
 }
 
 int calculateHeuristic(Position start, Position goal){  // Calculate the Manhattan distance between the start and goal positions
-    return std::abs(start.x - goal.x) + std::abs(start.y - goal.y); // Return the calculated Manhattan distance as the heuristic value
+    int dx = std::abs(start.x - goal.x);   // Calculate the absolute difference in the x-coordinates of the start and goal positions
+    int dy = std::abs(start.y - goal.y);   // Calculate the absolute difference in the y-coordinates of the start and goal positions
+    return 10 * std::max(dx, dy) + 4 * std::min(dx, dy); // Return the calculated Manhattan distance as the heuristic value
 }
 
-std::vector<Position> calculateAStar(Position start, Position goal, Environment& map){
-    std::vector<std::vector<int>> g_score(map.getHeight(), std::vector<int>(map.getWidth(), 99999));    // Initialize g_score with a large value
+std::vector<Position> calculateAStar(Position start, Position goal, Environment& map, const TSDFMap& tsdf){
+    std::vector<std::vector<int>> g_score(map.getHeight(), std::vector<int>(map.getWidth(), 9999999));    // Initialize g_score with a large value
     std::vector<std::vector<Position>> came_from(map.getHeight(), std::vector<Position>(map.getWidth(), {-1, -1})); // Initialize came_from with invalid positions
     std::priority_queue<AStarNode, std::vector<AStarNode>, CompareNodes> open_set;  // Priority queue to store nodes to be evaluated
 
@@ -730,25 +864,34 @@ std::vector<Position> calculateAStar(Position start, Position goal, Environment&
             return escape_path;  // Return the final path from start to goal
         }
 
-        std::vector<Position> neighbors = map.getLegalMoves(current_x, current_y, true);  // Get the legal moves (neighbors) from the current position
+        std::vector<Position> neighbors = map.getLegalMoves(current_x, current_y, true, tsdf);  // Get the legal moves (neighbors) from the current position
         for (const auto& neighbor : neighbors){ // Iterate through each neighbor of the current node
             int neighbor_x = neighbor.x;    // Get the x-coordinate of the neighbor
             int neighbor_y = neighbor.y;    // Get the y-coordinate of the neighbor
 
             int proximity_penalty = 0;   // Initialize a penalty for moving to a neighbor that is close to obstacles
-            for (int dy = -3; dy <= 3; ++dy){
-                for (int dx = -3; dx <= 3; ++dx){
-                    int check_x =neighbor_x + dx;   // Calculate the x-coordinate of the tile to check around the neighbor
-                    int check_y = neighbor_y + dy;   // Calculate the y-coordinate of the tile to check around the neighbor
-                    if (check_x >= 0 && check_x < map.getWidth() && check_y >= 0 && check_y < map.getHeight()){
-                        if (map.visits[check_y][check_x] > 0){
-                            proximity_penalty += 3;   // Increase the penalty for each visited tile within a 3-tile radius of the neighbor, discouraging paths that go near previously visited areas
-                        }
-                    }
-                }
+            
+            double tsdf_value = tsdf.getTSDFValue(neighbor_x, neighbor_y);   // Get the TSDF value for the neighbor position to assess proximity to obstacles
+
+            if (tsdf_value == -1) continue; // If the TSDF value is -1, skip this neighbor as it is considered invalid or out of bounds
+
+            if (tsdf_value < 3.0){
+                proximity_penalty = static_cast<int>(std::round((3.0 - tsdf_value) * 20.0)); // Apply a penalty based on how close the neighbor is to obstacles (closer = higher penalty)
             }
 
-            int tentative_g_score = g_score[current_y][current_x] + 1 + proximity_penalty;  // Calculate the tentative g_score for the neighbor (current g_score + cost to move to neighbor + proximity penalty)
+            auto [gradient_x, gradient_y] = tsdf.getSafetyGradient(current_x, current_y);
+            double move_length = std::hypot(neighbor_x - current_x, neighbor_y - current_y);
+            double gradient_alignment = 0.0;
+            if (move_length > 1e-6){
+                gradient_alignment = ((neighbor_x - current_x) * gradient_x +
+                                      (neighbor_y - current_y) * gradient_y) / move_length;
+            }
+            int gradient_penalty = static_cast<int>(std::round((1.0 - gradient_alignment) * 3.0));
+
+            int move_cost = (neighbor_x != current_x && neighbor_y != current_y) ? 14 : 10; // Determine the cost to move to the neighbor (14 for diagonal moves, 10 for straight moves)
+
+            int tentative_g_score = g_score[current_y][current_x] + proximity_penalty +
+                                    gradient_penalty + move_cost;  // Calculate the tentative g_score for the neighbor (current g_score + movement, clearance, and safety-direction costs)
 
             if (tentative_g_score < g_score[neighbor_y][neighbor_x]){   // If the tentative g_score is better than the previously recorded g_score for the neighbor
                 came_from[neighbor_y][neighbor_x] = {current_x, current_y}; // Record the current node as the best path to reach the neighbor
@@ -768,20 +911,65 @@ bool isInBounds(int x, int y, Environment& map){   // Check if the given coordin
     return (x >= 0 && x < map.getWidth() && y >= 0 && y < map.getHeight());   // Return true if the coordinates are within bounds, false otherwise
 }
 
+void runRootActionRollouts(MCTSNode& root, Environment& map, const TSDFMap& tsdf, std::mt19937& gen, int incoming_dx, int incoming_dy, int rollout_count = 1000){
+    if (root.children.empty()){
+        root.expandNode(map, tsdf);
+    }
+
+    for (int rollout = 0; rollout < rollout_count; ++rollout){
+        MCTSNode* leaf = &root;
+
+        // Selection: follow the existing tree until a leaf is reached.
+        while (!leaf->children.empty()){
+            MCTSNode* next = leaf->getBestChild(map);
+            if (next == nullptr){
+                break;
+            }
+            leaf = next;
+        }
+
+        // Expansion: create the leaf's possible successors once.
+        if (leaf->children.empty()){
+            leaf->expandNode(map, tsdf);
+        }
+
+        MCTSNode* simulation_node = leaf;
+        if (!leaf->children.empty()){
+            simulation_node = leaf->getBestChild(map);
+        }
+
+        if (simulation_node == nullptr){
+            continue;
+        }
+
+        int action_dx = simulation_node->state.x - leaf->state.x;
+        int action_dy = simulation_node->state.y - leaf->state.y;
+
+        // Simulation: evaluate a hypothetical continuation from the expanded node.
+        double reward = simulateActivePerception(
+            simulation_node, map, 20, tsdf, gen, action_dx, action_dy);
+
+        // Backpropagation: update every node from simulation_node to the root.
+        simulation_node->backpropagate(reward);
+    } 
+}
+
 int main(){
     // initialisation
-    int width, height, start_x, start_y;
-    int threshold = 7; // Threshold for determining if the drone is stuck (number of steps without discovering new tiles)
+    int width, height, start_x, start_y, ui_fov;
+    int threshold = 7; 
     Position prev_pos = {-1, -1};
 
-    if (!(std::cin >> width >> height >> start_x >> start_y) ) return 0;
+    if (!(std::cin >> width >> height >> start_x >> start_y >> ui_fov) ) return 0;
 
-    Environment true_map(width, height, 0);
-    Environment known_map(width, height, -1);
+    Environment true_map(width, height, 0, ui_fov);
+    Environment known_map(width, height, -1, ui_fov);
     Position drone_pos ={start_x, start_y};
+    TSDFMap tsdf(width, height, 5.0);
 
     int max_game_steps = 1000;
 
+    // Load the true map from input
     for (int y = 0; y < height; ++y){
         for (int x = 0; x < width; ++x){
             int tile;
@@ -792,166 +980,202 @@ int main(){
         }
     }
 
-    std::vector<Position> escape_path;
-    bool is_backtracking = false;
-
     std::cout << "MAP LOADED. STARTING LOOP...\n" << std::flush;
+
+    // Initialize the very first FOV and frontiers before the loop starts
+    std::vector<Position> init_walls = known_map.updateFOV(drone_pos.x, drone_pos.y, true_map.grid);
+    tsdf.updateTSDF(init_walls);
+    tsdf.TSDFToVisualiser();
+    known_map.updateFrontiersLocal(drone_pos.x, drone_pos.y);
+
+    std::deque<Position> current_plan; // The multi-step execution queue
+    std::vector<Position> escape_path; // Holds the remaining A* steps between planning phases
+    std::unique_ptr<MCTSNode> mcts_root = nullptr; // Initialize the MCTS root node to nullptr
+    bool mcts_failed = false;
 
     // game loop
     for (int game_step = 0; game_step < max_game_steps; game_step++){
-        known_map.updateFOV(drone_pos.x, drone_pos.y, true_map.grid);
         
-        //known_map.fillFOVHoles(drone_pos.x, drone_pos.y);  // Fill Bresenham raycaster gaps immediately after FOV
-
-        known_map.updateFrontiersLocal(drone_pos.x, drone_pos.y);
-
-        if (known_map.isFullyExplored()){
+        // Check if the environment is fully explored
+        if (known_map.isFullyExplored(drone_pos.x, drone_pos.y, tsdf)){
             std::cout << "DONE\n" << std::flush;
             break;
         }
 
-        known_map.updateTargetLock(drone_pos.x, drone_pos.y);
-
-        if (is_backtracking){   // If the drone is currently backtracking to a previous position, continue following the escape path
-            if (!escape_path.empty()){  // If there are still positions left in the escape path, move to the next position
-                drone_pos = escape_path[0]; // Update the drone's position to the next position in the escape path
-                escape_path.erase(escape_path.begin()); // Remove the first position from the escape path as it has been visited
-
-                known_map.visits[drone_pos.y][drone_pos.x] += 1;    // Increment the visit count for the new position in the known map to track how many times the drone has visited this tile
-                std::cout << "PATH " << drone_pos.x << " " << drone_pos.y << "\n" << std::flush;    // Output the current position of the drone to indicate the path it is following while backtracking
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));    // Pause for a short duration to visualize the drone's movement in the simulation
-                std::cout << drone_pos.x << " " << drone_pos.y << "\n" << std::flush;   // Output the current position of the drone again to indicate its movement in the simulation
-                
-                continue;   // Continue to the next iteration of the game loop to keep backtracking until the escape path is empty (skip MCTS)
-            }
-            else{
-                is_backtracking = false;   // If the escape path is empty, stop backtracking and proceed with MCTS for exploration
-            }
-        }
-
-        auto root = std::make_unique<MCTSNode>(drone_pos);  // Create a new root node for the MCTS tree with the current drone position as the state
-
-        // MCTS loop
-        for (int i = 0; i < 1000; i++){    // Perform 10,000 iterations of the MCTS algorithm to explore possible future states and gather information for decision-making
-            MCTSNode* leaf = selectNode(root.get());    // Select a leaf node from the MCTS tree to expand based on the UCT score
-            leaf->expandNode(known_map);    // Expand the selected leaf node by generating child nodes for all legal moves from its current position in the known map
-
-            MCTSNode* sim_node = leaf;  // Initialize the simulation node to the selected leaf node for running the simulation of the drone's movement and exploration
-            if (!leaf->children.empty()){
-                sim_node = leaf->children[0].get();
-            }
-
-            double reward = simulateActivePerception(sim_node, known_map, 20);
+        // --- PHASE 1: PLANNING ---
+        // Only run CPU-heavy tasks if the drone has no moves in its queue
+        if (current_plan.empty()) {
+            known_map.updateTargetLock(drone_pos.x, drone_pos.y);
+            bool is_surrounded = known_map.isSurrounded(drone_pos.x, drone_pos.y, tsdf);
             
-            sim_node->backpropagate(reward);
-        }
+            // Check if we need to trigger A* (surrounded, boredom, or continuing an existing escape path)
+            if (is_surrounded || !escape_path.empty() || mcts_failed) {
+                mcts_failed = false;
+                // If we don't already have an active escape path, calculate one
+                if (escape_path.empty()) {
+                    bool path_found = false;
 
-        std::cout << "PATH ";
-        MCTSNode* plan_node = root.get();
-        for (int p = 0; p < 8; ++p){
-            if (plan_node == nullptr || plan_node->children.empty()) break;
+                    while (!known_map.active_frontiers.empty()) {
+                        Position target_frontier = known_map.getNearestFrontier(drone_pos);
 
-            plan_node = plan_node->getBestRealChild(known_map, prev_pos);
-            if (plan_node != nullptr){ 
-                std::cout << plan_node->state.x << " " << plan_node->state.y << " ";
-            } else{
-                break;
-            }
-        }
-        std::cout << "\n" << std::flush;
-
-        std::cout << "FRONTIERS ";
-        for (const auto& frontier : known_map.active_frontiers){
-            std::cout << frontier.x << " " << frontier.y << " ";
-        }
-        std::cout << "\n" << std::flush;
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-        MCTSNode* best_next_node = root->getBestRealChild(known_map, prev_pos);
-
-        bool is_bored = known_map.isMCTSBored(drone_pos.x, drone_pos.y, 6);
-
-        if (best_next_node != nullptr){ // If a valid next node is found, move the drone to that position
-            int new_x = best_next_node->state.x; // Get the x-coordinate of the best next node's position
-            int new_y = best_next_node->state.y; // Get the y-coordinate of the best next node's position
-
-            if (known_map.visits[new_y][new_x] > 0 || is_bored){ // If the best next node has already been visited, it indicates that the drone is surrounded by previously visited tiles and may need to backtrack to find new frontiers
-                std::vector<Position> best_escape_path; // Calculate the best escape path to the nearest frontier
-                bool path_found = false;
-                
-                // Try local frontier set first
-                while (best_escape_path.empty()){
-                    Position target_frontier = known_map.getNearestFrontier(drone_pos); // Get the nearest frontier position from the current drone position to determine where to backtrack for exploration
-
-                    if (target_frontier.x != -1){ // If a valid target frontier is found
-                        best_escape_path = calculateAStar(drone_pos, target_frontier, known_map); // Calculate the A* path from the current drone position to the target frontier
-
-                        if (target_frontier == drone_pos){
-                            known_map.active_frontiers.erase(target_frontier); // If the target frontier is the same as the current drone position, remove it from the active frontiers set to avoid redundant exploration
-                            continue; // Set path_found to true since the drone is already at the target frontier
-                        }
-
-                        if (!best_escape_path.empty()){ // If a valid escape path is found
-                                path_found = true;
-                                break;
-                        } else{
-                            known_map.active_frontiers.erase(target_frontier); // If no valid escape path is found, remove the target frontier from the active frontiers set and continue searching for another frontier
-                        }
-                    } else{ 
-                        // No frontier found in local set - perform global scan to recover lost frontiers
-                        known_map.scanGlobalFrontiers();
-                        Position target_frontier_retry = known_map.getNearestFrontier(drone_pos);
+                        if (target_frontier.x == -1) break; // No valid frontiers found, exit the loop
                         
-                        if (target_frontier_retry.x != -1){
-                            // Found a frontier via global scan, retry A*
-                            best_escape_path = calculateAStar(drone_pos, target_frontier_retry, known_map);
-                            if (!best_escape_path.empty()){
+                        if (target_frontier == drone_pos){
+                            known_map.active_frontiers.erase(target_frontier);
+                            continue; // Skip to the next iteration if the target frontier is the same as the drone's current position
+                        }
+                        
+                        escape_path = calculateAStar(drone_pos, target_frontier, known_map, tsdf);
+
+                        if (!escape_path.empty()){
+                            path_found = true;
+                            break; // Exit the loop if a valid escape path is found
+                        } else {
+                            known_map.active_frontiers.erase(target_frontier);
+                        }
+                        
+                    } 
+                        
+                    // Failsafe global scan if local frontiers fail
+                    if (!path_found) {
+                        known_map.scanGlobalFrontiers();
+                        while (!known_map.active_frontiers.empty()) {
+                            Position target_frontier_retry = known_map.getNearestFrontier(drone_pos);
+                            if (target_frontier_retry.x == -1) break; // No valid frontiers found, exit the loop
+                            
+                            if (target_frontier_retry == drone_pos){
+                                known_map.active_frontiers.erase(target_frontier_retry);
+                                continue; // Skip to the next iteration if the target frontier is the same as the drone's current position
+                            }
+                            escape_path = calculateAStar(drone_pos, target_frontier_retry, known_map, tsdf);
+                        
+                            if (!escape_path.empty()){
                                 path_found = true;
-                                break;
+                                break; // Exit the loop if a valid escape path is found
+                            } else {
+                                known_map.active_frontiers.erase(target_frontier_retry);
                             }
                         }
-                        // Truly stuck - no reachable frontiers exist
+                    }
+
+                    if (!path_found || escape_path.empty()) {
+                        std::cout << "STUCK\n" << std::flush;
+                        break; // Exit the main loop if no escape path can be found
+                    }
+                    
+                    if (!escape_path.empty()) {
+                        std::cout << "[C++] GOING TO FRONTIER " << escape_path.back().x << ", " << escape_path.back().y << " \n" << std::flush;
+                    } else {
+                        std::cout << "STUCK\n" << std::flush;
                         break;
                     }
                 }
 
-                if (path_found){
-                    escape_path = best_escape_path; // Set the escape path to the calculated best escape path 
-                    std::cout << "[C++] GOING TO FRONTIER " << escape_path.back().x << ", " << escape_path.back().y << " " << std::flush;
-                    std::cout << "ASTAR_PATH " << drone_pos.x << " " << drone_pos.y << " " << std::flush;
-                    for (const auto& pos : escape_path){
-                        std::cout << pos.x << " " << pos.y << " ";
-                    }
-                    std::cout << "\n" << std::flush;
-
-                    is_backtracking = true;
-                    continue;   // Skip the rest of the loop and continue backtracking to the nearest frontier
-                } else{
-                    std::cout << "DONE\n" << std::flush;
-                    break;
+                // Push up to 3 steps of the A* path into the current execution plan to maintain sync
+                int steps_to_push = std::min((int)escape_path.size(), 3);
+                for (int i = 0; i < steps_to_push; ++i) {
+                    current_plan.push_back(escape_path[0]);
+                    escape_path.erase(escape_path.begin());
                 }
+
+                std::cout << "ASTAR_PATH ";
+                for (const auto& pos : escape_path) {
+                    std::cout << pos.x << " " << pos.y << " ";
+                }
+                std::cout << "\n" << std::flush;
+                
+            } else {
+                // RUN PERSISTENT MCTS 
+                if (!mcts_root){
+                    mcts_root = std::make_unique<MCTSNode>(drone_pos);
+                }
+                if (mcts_root->children.empty()){
+                    mcts_root->expandNode(known_map, tsdf);
+                }
+
+                std::mt19937 sim_gen(std::random_device{}()); // Initialize a Mersenne Twister random number
+                int curr_heading_x = (prev_pos.x != -1) ? (drone_pos.x - prev_pos.x) : 0; // Calculate the current heading in the x-direction based on the previous position
+                int curr_heading_y = (prev_pos.y != -1) ? (drone_pos.y - prev_pos.y) : 0; // Calculate the current heading in the y-direction based
+                runRootActionRollouts(*mcts_root, known_map, tsdf, sim_gen, curr_heading_x, curr_heading_y, 1000); // Run rollouts from the MCTS root node to evaluate potential moves and update the tree with rewards
+
+                MCTSNode* next_node = mcts_root->getBestRealChild(known_map, tsdf, prev_pos);
+
+                if (next_node != nullptr && (known_map.visits[next_node->state.y][next_node->state.x] == 0)){
+                    current_plan.push_back(next_node->state);   
+                }
+
+
+                // Visualizer Output: Print the projected MCTS path
+                std::cout << "PATH ";
+                for (const auto& step : current_plan){
+                    std::cout << step.x << " " << step.y << " ";
+                }
+                std::cout << "\n" << std::flush;
+
+                // Visualizer Output: Print active frontiers
+                std::cout << "FRONTIERS ";
+                for (const auto& frontier : known_map.active_frontiers){
+                    std::cout << frontier.x << " " << frontier.y << " ";
+                }
+                std::cout << "\n" << std::flush;
+            }
+        }
+
+        // --- PHASE 2: EXECUTION ---
+        if (!current_plan.empty()) {
+            Position next_step = current_plan.front();
+
+            const auto legal_moves = known_map.getLegalMoves(drone_pos.x, drone_pos.y, true, tsdf);
+            bool move_is_legal = std::find(legal_moves.begin(), legal_moves.end(), next_step) != legal_moves.end();
+            if (!move_is_legal) {
+                current_plan.clear(); // Trash the dangerous plan
+                escape_path.clear();  // Also trash the remaining A* path if we were backtracking
+                mcts_root.reset(); // Reset the MCTS root to force a new search in the next planning phase
+                mcts_failed = true; // Set the flag to indicate that MCTS failed to find a valid move
+                continue;             // Immediately loop back to Phase 1 and recalculate
             }
 
+            current_plan.pop_front();
+            
             prev_pos = drone_pos;
-            drone_pos = best_next_node->state;
+            drone_pos = next_step;
+
+            if (mcts_root){
+                mcts_root = mcts_root->extractChild(drone_pos); // Move the MCTS root to the child corresponding to the new drone position
+            }
+            if (!escape_path.empty()){
+                mcts_root.reset(); // Reset the MCTS root if we are following an A* escape path to avoid conflicts
+            }
+            
             known_map.visits[drone_pos.y][drone_pos.x] += 1;
+            
+            // IMPORTANT: Update sensors IMMEDIATELY after taking the physical step
+            std::vector<Position> new_walls = known_map.updateFOV(drone_pos.x, drone_pos.y, true_map.grid);
+            tsdf.updateTSDF(new_walls);
+            tsdf.TSDFToVisualiser();
+            //known_map.fillFOVHoles(drone_pos.x, drone_pos.y);
+            known_map.updateFrontiersLocal(drone_pos.x, drone_pos.y);
+            known_map.scanGlobalFrontiers();
+            
             std::cout << drone_pos.x << " " << drone_pos.y << "\n" << std::flush;
-        }
-        else{
-            std::cout << "STUCK\n" << std::flush;
-            break;
-        }
-        // Pause slightly to visualize the simulation
-        // std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        // Check if the environment is fully explored
-        if (known_map.isFullyExplored()){
-            std::cout << "DONE\n" << std::flush;
-            break;
+            std::cout << "PATH ";
+            for (const auto& step : current_plan){
+                std::cout << step.x << " " << step.y << " ";
+            }
+            std::cout << "\n" << std::flush;
+
+        } else {
+            // If the queue is STILL empty after planning, we are truly stuck
+            mcts_failed = true; // Set the flag to indicate that MCTS failed to find a valid move
+            mcts_root.reset(); // Reset the MCTS root to force a new search in the next planning phase
+            continue; // Skip the execution phase and loop back to planning in the next iteration
         }
 
-        // If the maximum number of game steps is reached and the environment is not fully explored, print "STUCK"
+        // Pause slightly to visualize the simulation (adjust timing as needed)
+        //std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        // If the maximum number of game steps is reached
         if (game_step == max_game_steps - 1){
             std::cout << "STUCK\n" << std::flush;
         }

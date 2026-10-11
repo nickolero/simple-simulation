@@ -1,7 +1,6 @@
 import tkinter as tk
 import subprocess
 import threading
-import time
 import random
 import queue 
 
@@ -10,13 +9,12 @@ class DroneVisualizer:
         self.root = root
         self.root.title("MCTS Drone - Active Frontiers")
         
-        # Default starting values
         self.width = 30
         self.height = 30
         self.max_canvas_dim = 700 
         self.drone_pos = (0, 0)
         self.running = False
-        self.frontiers = set() # NEW: Store active frontiers
+        self.frontiers = set() 
         
         self.ui_queue = queue.Queue()
         
@@ -53,6 +51,21 @@ class DroneVisualizer:
         self.start_btn = tk.Button(control_frame, text="Start Simulation", command=self.start_simulation, bg="#bbf7d0")
         self.start_btn.grid(row=0, column=10, padx=6)
         
+        # NEW: Playback Speed Slider
+        self.speed_slider = tk.Scale(control_frame, from_=5, to=500, orient=tk.HORIZONTAL, label="Delay (ms)", resolution=5)
+        self.speed_slider.set(100)
+        self.speed_slider.grid(row=0, column=11, padx=10)
+
+        # NEW: TSDF Toggle Checkbox
+        self.show_tsdf = tk.BooleanVar(value=False)
+        self.tsdf_btn = tk.Checkbutton(control_frame, text="Show TSDF", variable=self.show_tsdf, command=self.draw_grid)
+        self.tsdf_btn.grid(row=0, column=12, padx=6)
+
+        # NEW: FOV Radius Slider
+        self.fov_slider = tk.Scale(control_frame, from_=2, to=10, orient=tk.HORIZONTAL, label="FOV", resolution=1)
+        self.fov_slider.set(4)
+        self.fov_slider.grid(row=0, column=13, padx=10)
+
         # --- The Canvas ---
         self.canvas = tk.Canvas(root, bg="white")
         self.canvas.pack(pady=5)
@@ -79,7 +92,7 @@ class DroneVisualizer:
         self.grid = [[0 for _ in range(self.width)] for _ in range(self.height)]
         self.visit_counts = [[0 for _ in range(self.width)] for _ in range(self.height)]
         self.explored = [[False for _ in range(self.width)] for _ in range(self.height)]
-        self.frontiers = set() # Reset frontiers on resize
+        self.frontiers = set() 
         
         self.drone_pos = (0, 0)
         self.visit_counts[0][0] = 1 
@@ -96,15 +109,14 @@ class DroneVisualizer:
             density = max(0.0, min(0.60, density))
         except ValueError:
             density = 0.25
-
         try:
             block_size = int(self.block_size_input.get())
             block_size = max(1, block_size)
         except ValueError:
             block_size = 3
 
-        macro_density = density * 0.6  
-        micro_density = density * 0.4  
+        macro_density = density * 1.0  
+        micro_density = density * 0.0  
 
         coarse_w = self.width // block_size
         coarse_h = self.height // block_size
@@ -149,14 +161,28 @@ class DroneVisualizer:
                 x2, y2 = x1 + self.tile_size, y1 + self.tile_size
                 
                 color = "white"
-                if self.grid[y][x] == 1:
-                    color = "#333333"
-                elif self.visit_counts[y][x] > 0:
-                    color = "#a8f0b1"
-                elif self.explored[y][x]:
-                    color = "#fffac8"
+                # --- NEW: TSDF Heatmap Override ---
+                if self.show_tsdf.get() and hasattr(self, 'tsdf_grid') and self.tsdf_grid:
+                    val = self.tsdf_grid[y][x]
+                    if val <= 0.0:
+                        color = "#333333" # Solid Wall
+                    elif val >= 5.0:
+                        color = "white"   # Safe Space
+                    else:
+                        # Gradient from Red (Danger) to White (Safe)
+                        intensity = int((val / 5.0) * 255)
+                        color = f"#ff{intensity:02x}{intensity:02x}"
+                else:
+                    # --- Standard Exploration Colors ---
+                    if self.grid[y][x] == 1:
+                        color = "#333333"
+                    elif self.visit_counts[y][x] > 0:
+                        color = "#a8f0b1"
+                    elif self.explored[y][x]:
+                        color = "#fffac8"
+
                 
-                # OVERRIDE: If this tile is an active frontier, paint it purple
+                
                 if hasattr(self, 'frontiers') and (x, y) in self.frontiers:
                     color = "#c084fc"
                     
@@ -171,7 +197,6 @@ class DroneVisualizer:
                     pad = max(2, self.tile_size // 8)
                     self.canvas.create_oval(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill="blue")
 
-                # NEW: Draw the paths as a persistent layer so they don't get deleted!
                 if hasattr(self, 'mcts_plan') and self.mcts_plan:
                     line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
                                 self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
@@ -186,12 +211,18 @@ class DroneVisualizer:
                         self.canvas.create_line(line_points, fill="red", width=2, tags="plan")
 
                 if hasattr(self, 'astar_plan') and self.astar_plan:
-                    line_points = []
+                    # 1. Anchor the start of the line exactly to the drone's center
+                    line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
+                                self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
+                    
+                    # 2. Add all the remaining A* escape coordinates
                     for i in range(0, len(self.astar_plan), 2):
                         px, py = self.astar_plan[i], self.astar_plan[i+1]
                         line_points.extend([px * self.tile_size + (self.tile_size / 2), py * self.tile_size + (self.tile_size / 2)])
+                        
                     if len(line_points) >= 4:
-                        self.canvas.create_line(line_points, fill="magenta", width=2, dash=(4, 2), tags="astar_plan")
+                        # 3. Draw it as a thick brown dotted line
+                        self.canvas.create_line(line_points, fill="#8B4513", width=3, dash=(2, 4), tags="astar_plan")
 
     def toggle_obstacle(self, event):
         if self.running: return 
@@ -218,29 +249,18 @@ class DroneVisualizer:
         err = dx - dy
 
         while True:
-            # 1. Target reached
-            if x0 == x1 and y0 == y1:
-                return True
-            
-            # 2. Collision check (Python only tracks 0 and 1 for obstacles)
-            if self.grid[y0][x0] == 1:
-                return False
-                
+            if x0 == x1 and y0 == y1: return True
+            if self.grid[y0][x0] == 1: return False
             e2 = 2 * err
             prev_x, prev_y = x0, y0
-            
-            # 3. Strict < and >
             if e2 > -dy:
                 err -= dy
                 x0 += sx
             if e2 < dx:
                 err += dx
                 y0 += sy
-                
-            # 4. Diagonal check
             if x0 != prev_x or y0 != prev_y:
-                if self.grid[prev_y][x0] == 1 or self.grid[y0][prev_x] == 1:
-                    return False
+                if self.grid[prev_y][x0] == 1 or self.grid[y0][prev_x] == 1: return False
 
     def process_queue(self):
         try:
@@ -250,15 +270,17 @@ class DroneVisualizer:
                 if msg_type == "FRONTIERS":
                     self.frontiers = data
                     self.draw_grid()
-
+                elif msg_type == "TSDF":
+                    # Reshape the flat 1D list back into a 2D grid matrix
+                    self.tsdf_grid = [data[i * self.width:(i + 1) * self.width] for i in range(self.height)]
+                    self.draw_grid()
                 elif msg_type == "ASTAR":
                     self.astar_plan = data
-                    self.mcts_plan = [] # Clear old MCTS plans
-                    self.draw_grid()
-                        
+                    #self.mcts_plan = [] 
+                    self.draw_grid()    
                 elif msg_type == "PATH":
                     self.mcts_plan = data
-                    self.astar_plan = [] # Clear old A* plans
+                    #self.astar_plan = [] 
                     self.draw_grid()
                         
                 elif msg_type == "MOVE":
@@ -266,18 +288,21 @@ class DroneVisualizer:
                     self.drone_pos = (new_x, new_y)
                     self.visit_counts[new_y][new_x] += 1
 
-                    radius = 4
+                    radius = self.fov_slider.get()
                     radius_squared = radius ** 2
-                    
                     for dy in range(-radius, radius + 1):
                         for dx in range(-radius, radius + 1):
-                            if (dx**2 + dy**2) > radius_squared:
-                                continue
+                            if (dx**2 + dy**2) > radius_squared: continue
                             ex, ey = new_x + dx, new_y + dy
                             if 0 <= ex < self.width and 0 <= ey < self.height:
                                 if self.has_line_of_sight(new_x, new_y, ex, ey):
                                     self.explored[ey][ex] = True
                     self.draw_grid()
+                    
+                    # DECOUPLING MAGIC: Stop processing the queue and wait based on the slider value!
+                    if self.running:
+                        self.root.after(self.speed_slider.get(), self.process_queue)
+                    return # Exit the function so the UI can sleep
                     
                 elif msg_type == "HALT":
                     print(f"\n>>> SIMULATION HALTED: {data} <<<\n")
@@ -285,19 +310,20 @@ class DroneVisualizer:
                     self.apply_btn.config(state=tk.NORMAL)
                     self.gen_btn.config(state=tk.NORMAL)
                     self.running = False
-                    
+                    return
                 elif msg_type == "PRINT":
                     print(f"[C++] {data}")
 
         except queue.Empty:
             pass
             
+        # If the queue was empty (C++ is thinking), check again in 10ms
         if self.running:
-            self.root.after(20, self.process_queue)
+            self.root.after(10, self.process_queue)
 
     def run_cpp_brain(self):
         process = subprocess.Popen(['./drone'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        setup_data = f"{self.width} {self.height} {self.drone_pos[0]} {self.drone_pos[1]}\n"
+        setup_data = f"{self.width} {self.height} {self.drone_pos[0]} {self.drone_pos[1]} {self.fov_slider.get()}\n"
         for row in self.grid:
             setup_data += " ".join(map(str, row)) + "\n"
         process.stdin.write(setup_data)
@@ -313,17 +339,18 @@ class DroneVisualizer:
                     frontier_set.add((coords[i], coords[i+1]))
                 self.ui_queue.put(("FRONTIERS", frontier_set))
                 continue
-
             if line.startswith("ASTAR_PATH"):
                 coords = list(map(int, line.split()[1:]))
                 self.ui_queue.put(("ASTAR", coords))
                 continue
-
             if line.startswith("PATH"):
                 coords = list(map(int, line.split()[1:]))
                 self.ui_queue.put(("PATH", coords))
                 continue
-
+            if line.startswith("TSDF"):
+                coords = list(map(float, line.split()[1:]))
+                self.ui_queue.put(("TSDF", coords))
+                continue
             if line == "DONE" or line == "STUCK":
                 self.ui_queue.put(("HALT", line))
                 break
@@ -332,7 +359,7 @@ class DroneVisualizer:
             if len(parts) == 2 and parts[0].lstrip('-').isdigit() and parts[1].lstrip('-').isdigit():
                 new_x, new_y = int(parts[0]), int(parts[1])
                 self.ui_queue.put(("MOVE", (new_x, new_y)))
-                time.sleep(0.04) 
+                # REMOVED: time.sleep(0.04) -> C++ now runs at maximum speed!
             else:
                 if not line.startswith("PATH") and not line.startswith("ASTAR_PATH") and not line.startswith("FRONTIERS"):
                     self.ui_queue.put(("PRINT", line))
