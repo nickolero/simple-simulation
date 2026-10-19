@@ -134,6 +134,7 @@ class Environment{
         int width;
         int height;
         int fov_radius;
+        int camera_fov_radius;
 
         // FOV
         // 8-directional movement (E, SE, S, SW, W, NW, N, NE)
@@ -144,11 +145,25 @@ class Environment{
         int getHeight() const { return height; };
         std::vector<std::vector<int>>grid;
         std::vector<std::vector<int>>visits;
-        std::set<Position> active_frontiers;   // Set of positions representing the active frontiers (unknown tiles) in the environment
-        // -1...unknown, 0...known free, 1...known obstacle
-        Environment(int w, int h, int default_value, int fov) : width(w), height(h), fov_radius(fov){ // Initialize the grid and visits matrices with the specified dimensions and default values
+        std::vector<std::vector<int>> camera_observations;
+        std::set<Position> active_frontiers;
+        std::set<Position> lidar_frontiers;
+        std::set<Position> camera_frontiers;
+        std::set<Position> current_ndlf;
+        std::set<Position> pending_ndlf_cells;
+        Position current_ndlf_anchor = {-1, -1};
+        int current_ndlf_id = 0;
+        bool ndlf_initialized = false;
+        int ndlf_remaining_count = 0;
+        // Grid states are -1 unseen, 0 LIDAR-seen, 1 wall, and 2 camera-covered.
+        Environment(int w, int h, int default_value, int fov, int camera_fov) : width(w), height(h), fov_radius(fov), camera_fov_radius(std::max(1, camera_fov)){ // Initialize the dual-sensor state.
             grid = std::vector<std::vector<int>>(height, std::vector<int>(width, default_value));
             visits = std::vector<std::vector<int>>(height, std::vector<int>(width, 0));
+            camera_observations = std::vector<std::vector<int>>(height, std::vector<int>(width, 0));
+        }
+
+        int currentNDLFRemaining() const{
+            return ndlf_remaining_count;
         }
 
         void addObstacles(int x, int y){    // Mark the specified position in the grid as an obstacle (1) if it's within bounds
@@ -171,7 +186,7 @@ class Environment{
                 }
 
                 // Check if the current point is not the endpoint and is an obstacle (1), return false (no line of sight)
-                if ((x0 != x1 || y0 != y1) && map_data[y0][x0] != 0){
+                if ((x0 != x1 || y0 != y1) && map_data[y0][x0] == 1){
                     return false;
                 }
 
@@ -188,7 +203,7 @@ class Environment{
                     y0 += sy; // Move to the next point in the y-direction based on the step direction
                 }
                 if (prev_x != x0 && prev_y != y0){ // If both x and y coordinates have changed (diagonal movement)
-                    if (map_data[prev_y][x0] != 0 || map_data[y0][prev_x] != 0){ // If the horizontal or vertical neighbors of the current point are obstacles (1)
+                    if (map_data[prev_y][x0] == 1 || map_data[y0][prev_x] == 1){ // If the horizontal or vertical neighbors of the current point are obstacles (1)
                         return false; // Return false (no line of sight)
                     }
                 }
@@ -196,10 +211,46 @@ class Environment{
             return true; // If the loop completes without encountering an obstacle, return true (line of sight exists)
         }
 
+        // Camera rays may pass through known free or camera-covered cells, but not through unseen fog.
+        bool hasCameraLineOfSight(int x0, int y0, int x1, int y1) const{
+            int delta_x = std::abs(x1 - x0);
+            int delta_y = std::abs(y1 - y0);
+            int step_x = (x0 < x1) ? 1 : -1;
+            int step_y = (y0 < y1) ? 1 : -1;
+            int error = delta_x - delta_y;
+
+            while (true){
+                if (x0 == x1 && y0 == y1){
+                    return true;
+                }
+                if ((x0 != x1 || y0 != y1) && (grid[y0][x0] == -1 || grid[y0][x0] == 1)){
+                    return false;
+                }
+                int doubled_error = 2 * error;
+                int previous_x = x0;
+                int previous_y = y0;
+                if (doubled_error > -delta_y){
+                    error -= delta_y;
+                    x0 += step_x;
+                }
+                if (doubled_error < delta_x){
+                    error += delta_x;
+                    y0 += step_y;
+                }
+                if (previous_x != x0 && previous_y != y0 &&
+                    (grid[previous_y][x0] == -1 || grid[y0][previous_x] == -1 || 
+                     grid[previous_y][x0] == 1 || grid[y0][previous_x] == 1)){
+                    return false;
+                }
+            }
+        }
+
         // Update the field of view (FOV) of the drone based on its current position and the true map
-        std::vector<Position> updateFOV(int drone_x, int drone_y, std::vector<std::vector<int>>& true_map){  
+        std::vector<Position> updateLidarFOV(int drone_x, int drone_y, std::vector<std::vector<int>>& true_map){  
             std::vector<Position> new_walls; // Vector to store the positions of newly discovered walls (obstacles) in the FOV
-            grid[drone_y][drone_x] = 0; // Mark the drone's current position as known free space (0) in the grid
+            if (grid[drone_y][drone_x] == -1){
+                grid[drone_y][drone_x] = 0;
+            }
             int radius = fov_radius; // Define the radius of the field of view (FOV) around the drone's position
             int radius_squared = radius * radius; // Calculate the square of the radius for distance comparison
 
@@ -218,12 +269,25 @@ class Environment{
                             if (grid[view_y][view_x] == -1 && true_map[view_y][view_x] == 1){ // If the cell in the grid is unknown (-1) and the corresponding cell in the true map is an obstacle (1)
                                 new_walls.push_back({view_x, view_y}); // Add the position of the newly discovered wall (obstacle) to the new_walls vector
                             }
-                            grid[view_y][view_x] = true_map[view_y][view_x]; // Update the cell in the grid to reflect the corresponding value from the true map (0 for free space, 1 for obstacle) if there is a clear line of sight
+                            if (true_map[view_y][view_x] == 1){
+                                grid[view_y][view_x] = 1;
+                            } else if (grid[view_y][view_x] == -1){
+                                grid[view_y][view_x] = 0;
+                                if (ndlf_initialized){
+                                    pending_ndlf_cells.insert({view_x, view_y});
+                                }
+                            }
                         }
                     }   
                 }
             }
-            return new_walls; // Return the list of newly discovered walls (obstacles) in the FOV
+            //rebuildFrontiers();
+            return new_walls;
+        }
+
+        // Keep the original method name as a compatibility wrapper for the LIDAR sensor.
+        std::vector<Position> updateFOV(int drone_x, int drone_y, std::vector<std::vector<int>>& true_map){
+            return updateLidarFOV(drone_x, drone_y, true_map);
         }
 
         // Check if the specified position (x, y) is safe for the drone to move to (within bounds and not an obstacle)
@@ -261,10 +325,18 @@ class Environment{
             return legal_moves;
         }
 
-        // Explore the field of view (FOV) of the drone at its current position (drone_x, drone_y) and return the number of newly discovered tiles
-        int exploreFOV(int drone_x, int drone_y){
-            int newly_discovered = 0;   // Count of newly discovered tiles in the FOV
-            int radius = fov_radius; // Define the radius of the field of view (FOV) around the drone's position
+        // Store separate camera metrics so MCTS can reward discovery and punish overlap.
+        struct CameraObservation {
+            int newly_covered = 0;
+            int overlap = 0;
+            int obstacle_overlap = 0;
+            int newly_covered_ndlf = 0;
+        };
+
+
+        CameraObservation estimateCameraFOV(int drone_x, int drone_y){
+            CameraObservation observation;
+            int radius = camera_fov_radius;
             int radius_squared = radius * radius; // Calculate the square of the radius for distance comparison
 
             // Check the FOV area around the drone's position to see if any unknown tiles (-1) are discovered
@@ -277,18 +349,72 @@ class Environment{
                     int view_x = drone_x + dx; 
                     int view_y = drone_y + dy;
 
-                    // Check if the calculated coordinates are within the bounds of the grid and if the tile is unknown (-1)
+                    // Check if the calculated coordinates are within the bounds of the grid.
                     if (view_x >= 0 && view_x < width && view_y >= 0 && view_y < height){
-                        if (hasLineOfSight(drone_x, drone_y, view_x, view_y, grid)){
-                            if (grid[view_y][view_x] == -1){
-                                newly_discovered += 1;  // Increment the count of newly discovered tiles
-                                grid[view_y][view_x] = 0;   // Mark the tile as known free space (0) in the grid
+                        if (hasCameraLineOfSight(drone_x, drone_y, view_x, view_y)){
+                            if (grid[view_y][view_x] == 1){
+                                observation.obstacle_overlap++;
+                            } else {
+                                if (grid[view_y][view_x] == 0){
+                                    observation.newly_covered++;
+                                    if (isInsideCurrentNDLF({view_x, view_y})){
+                                        observation.newly_covered_ndlf++;
+                                    }
+                                } else if (grid[view_y][view_x] == 2){
+                                    observation.overlap++;
+                                }
                             }
                         }
                     }
                 }    
             }
-            return newly_discovered;    // Return the count of newly discovered tiles in the FOV
+            return observation;
+        }
+
+        // Observe with the smaller camera sensor and convert visible LIDAR cells from 0 to 2.
+        CameraObservation observeCameraFOV(int drone_x, int drone_y){
+            CameraObservation observation;
+            int radius = camera_fov_radius;
+            int radius_squared = radius * radius; // Calculate the square of the radius for distance comparison
+
+            // Check the FOV area around the drone's position to see if any unknown tiles (-1) are discovered
+            for (int dy = -radius; dy <= radius; ++dy){
+                for (int dx = -radius; dx <= radius; ++dx){
+                    if (dx * dx + dy * dy > radius_squared){ // Skip cells that are outside the circular FOV radius
+                        continue;
+                    }
+
+                    int view_x = drone_x + dx; 
+                    int view_y = drone_y + dy;
+
+                    // Check if the calculated coordinates are within the bounds of the grid.
+                    if (view_x >= 0 && view_x < width && view_y >= 0 && view_y < height){
+                        if (hasCameraLineOfSight(drone_x, drone_y, view_x, view_y)){
+                            if (grid[view_y][view_x] == 1){
+                                observation.obstacle_overlap++;
+                            } else {
+                                camera_observations[view_y][view_x]++;
+                                if (grid[view_y][view_x] == 0){
+                                    observation.newly_covered++;
+                                    grid[view_y][view_x] = 2;
+                                    if (isInsideCurrentNDLF({view_x, view_y})){
+                                        ndlf_remaining_count--;
+                                    }
+                                } else if (grid[view_y][view_x] == 2){
+                                    observation.overlap++;
+                                }
+                            }
+                        }
+                    }
+                }    
+            }
+            //rebuildFrontiers();
+            return observation;
+        }
+
+        // Preserve the previous helper for callers that only need a new-cell count.
+        int exploreFOV(int drone_x, int drone_y){
+            return observeCameraFOV(drone_x, drone_y).newly_covered;
         }
 
         // Fill isolated -1 artifacts left by Bresenham raycaster gaps
@@ -335,68 +461,150 @@ class Environment{
             }
         }
 
-        // Rebuild entire frontier set from scratch (cures amnesia bug from local erasures)
-        // Call this periodically when stuck or when frontier count drops unexpectedly
-        void scanGlobalFrontiers(){
-            active_frontiers.clear();  // Wipe out old frontiers
-            
-            for (int y = 0; y < height; ++y){
-                for (int x = 0; x < width; ++x){
-                    if (isFrontier(x, y)){
-                        active_frontiers.insert({x, y});
+        // Return the connected component of a set of cells using 4-connected motion.
+        std::set<Position> connectedComponent(const std::set<Position>& source, Position seed) const{
+            std::set<Position> component;
+            if (source.find(seed) == source.end()){
+                return component;
+            }
+            std::queue<Position> pending;
+            pending.push(seed);
+            component.insert(seed);
+            while (!pending.empty()){
+                Position current = pending.front();
+                pending.pop();
+                for (int direction = 0; direction < 4; ++direction){
+                    Position neighbor = {current.x + dx[direction * 2], current.y + dy[direction * 2]};
+                    if (source.find(neighbor) != source.end() && component.insert(neighbor).second){
+                        pending.push(neighbor);
                     }
                 }
             }
+            return component;
         }
 
-        // Check if the entire environment has been fully explored
-        // Only returns true if all REACHABLE -1 tiles are gone (ignores walled-off regions)
-        bool isFullyExplored(int start_x, int start_y, const TSDFMap& tsdf){
-            // Quick scan: any -1 at all?
-            bool has_unknown = false;
+        // Build the first NDLF from the initial LIDAR-visible free component.
+        void initializeCurrentNDLF(Position seed){
+            std::set<Position> lidar_cells;
             for (int y = 0; y < height; ++y){
                 for (int x = 0; x < width; ++x){
-                    if (grid[y][x] == -1){
-                        has_unknown = true;
-                        break;
+                    if (grid[y][x] == 0){
+                        lidar_cells.insert({x, y});
                     }
                 }
-                if (has_unknown) break;
             }
-            
-            // No unknown tiles = fully explored
-            if (!has_unknown) return true;
-            
-            // If unknown tiles exist, check if any are reachable from known free space via BFS
-            // Unreachable/walled-off regions don't prevent completion
-            std::queue<Position> frontier_q;
-            std::vector<std::vector<bool>> visited(height, std::vector<bool>(width, false));
-            
-            // Seed BFS with all known free tiles
-            frontier_q.push({start_x, start_y});
-            visited[start_y][start_x] = true;
-        
-            
-            // BFS to find if any -1 is reachable
-            while (!frontier_q.empty()){
-                Position current = frontier_q.front();
-                frontier_q.pop();
-                
-                std::vector<Position> moves = getLegalMoves(current.x, current.y, false, tsdf);
+            current_ndlf = connectedComponent(lidar_cells, seed);
+            ndlf_remaining_count = current_ndlf.size();
+            current_ndlf_anchor = seed;
+            current_ndlf_id = 1;
+            ndlf_initialized = true;
+            pending_ndlf_cells.clear();
+            rebuildFrontiers();
+        }
 
-                for (const auto& move : moves){
-                    if (visited[move.y][move.x]) continue; // Already visited
-                    visited[move.y][move.x] = true; // Mark as visited
-                    if (grid[move.y][move.x] == -1){
-                        return false; // Found a reachable unknown tile, not fully explored
+        // Check whether a position belongs to the current NDLF.
+        bool isInsideCurrentNDLF(Position position) const{
+            return current_ndlf.find(position) != current_ndlf.end();
+        }
+
+        // Activate the next NDLF only after the current NDLF has been completely camera-covered.
+        bool activateNextNDLF(Position current_position){
+            for (auto it = pending_ndlf_cells.begin(); it != pending_ndlf_cells.end();){
+                if (grid[it->y][it->x] != 0){
+                    it = pending_ndlf_cells.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            
+            if (currentNDLFRemaining() != 0 || pending_ndlf_cells.empty()){
+                return false;
+            }
+
+            int closest_distance = 9999999;
+            Position closest_ndlf = {-1, -1};
+            for (const auto& pending_ndlf_cell : pending_ndlf_cells){
+                int distance_to_ndlf = std::abs(pending_ndlf_cell.x - current_position.x) + std::abs(pending_ndlf_cell.y - current_position.y);
+                if (distance_to_ndlf < closest_distance){
+                    closest_distance = distance_to_ndlf;
+                    closest_ndlf = pending_ndlf_cell;
+                }
+            }
+
+            current_ndlf = connectedComponent(pending_ndlf_cells, closest_ndlf);
+            ndlf_remaining_count = current_ndlf.size();
+            
+            for (const Position& cell : current_ndlf){
+                pending_ndlf_cells.erase(cell);
+            }
+            
+            current_ndlf_anchor = *current_ndlf.begin();
+            current_ndlf_id++;
+            rebuildFrontiers();
+            
+            return true;
+        }
+
+        // Recompute both frontier types from the monotonic grid state.
+        void rebuildFrontiers(){
+            lidar_frontiers.clear();
+            camera_frontiers.clear();
+            for (int y = 0; y < height; ++y){
+                for (int x = 0; x < width; ++x){
+                    if (grid[y][x] != 0){
+                        continue;
                     }
-                    if (grid[move.y][move.x] == 0){ // Only enqueue known free space for further exploration
-                        frontier_q.push(move);
+                    bool next_to_unseen = false;
+                    bool next_to_camera = false;
+                    for (int direction = 0; direction < 4; ++direction){
+                        int nx = x + dx[direction * 2];
+                        int ny = y + dy[direction * 2];
+                        if (nx < 0 || nx >= width || ny < 0 || ny >= height){
+                            continue;
+                        }
+                        next_to_unseen = next_to_unseen || grid[ny][nx] == -1;
+                        next_to_camera = next_to_camera || grid[ny][nx] == 2;
+                    }
+                    if (next_to_unseen){
+                        lidar_frontiers.insert({x, y});
+                    }
+                    if (next_to_camera){
+                        camera_frontiers.insert({x, y});
                     }
                 }
             }
-            // All reachable space is explored (unreachable -1s are ignored)
-            return true;
+            active_frontiers = camera_frontiers;
+        }
+
+        // Keep the old frontier-refresh entry point, now backed by both frontier sets.
+        void scanGlobalFrontiers(){
+            rebuildFrontiers();
+        }
+
+        // Check whether every reachable non-wall tile has been camera-covered.
+        bool isFullyExplored(int start_x, int start_y, const TSDFMap& tsdf){
+            std::queue<Position> covered_queue;
+            std::vector<std::vector<bool>> covered_visited(height, std::vector<bool>(width, false));
+            covered_queue.push({start_x, start_y});
+            covered_visited[start_y][start_x] = true;
+
+            while (!covered_queue.empty()){
+                Position current = covered_queue.front();
+                covered_queue.pop();
+                for (const Position& move : getLegalMoves(current.x, current.y, false, tsdf)){
+                    if (covered_visited[move.y][move.x]){
+                        continue;
+                    }
+                    if (grid[move.y][move.x] == -1 || grid[move.y][move.x] == 0){
+                        return false;
+                    }
+                    if (grid[move.y][move.x] == 2){
+                        covered_visited[move.y][move.x] = true;
+                        covered_queue.push(move);
+                    }
+                }
+            }
+            return grid[start_y][start_x] == 2;
         }
 
         Position current_target = {-1, -1};   // Current target position for the drone to move towards (initialized to an invalid position)
@@ -510,8 +718,19 @@ class Environment{
         bool isSurrounded(int drone_x, int drone_y, const TSDFMap& tsdf){
             std::vector<Position> moves = getLegalMoves(drone_x, drone_y, true, tsdf);   // Get the list of legal moves (positions) the drone can move to from its current position
             for (const auto& move : moves){
-                if (visits[move.y][move.x] == 0){   // If any of the legal moves lead to an unvisited tile (visits count is 0), the drone is not considered surrounded
-                    return false;   // Return false indicating that there are unvisited tiles available for exploration
+                // Any adjacent LIDAR-only cell is a valid local exploration opportunity.
+                //if (grid[move.y][move.x] == 0){
+                //    return false;
+                //}
+                // Revisited camera-covered cells do not prevent the A* fallback.
+                //if (grid[move.y][move.x] == 2){
+                //    continue;
+                //}
+                //if (visits[move.y][move.x] == 0){   // If any of the legal moves lead to an unvisited tile (visits count is 0), the drone is not considered surrounded
+                //    return false;   // Return false indicating that there are unvisited tiles available for exploration
+                //}
+                if (estimateCameraFOV(move.x, move.y).newly_covered > 0){   // If any of the legal moves lead to a tile that would result in newly covered camera observations, the drone is not considered surrounded
+                    return false;   // Return false indicating that there are opportunities for exploration through camera coverage
                 }
             }
             return true;    // If all legal moves lead to visited tiles, the drone is considered surrounded
@@ -585,8 +804,8 @@ struct MCTSNode{
         for (const auto& child : children){  // Iterate through all child nodes of the current node to evaluate their UCT scores
             const Position& position = child->state;  // Get the position represented by the current child node
 
-            if (map.grid[position.y][position.x] == 1 || map.visits[position.y][position.x] > 0){
-                continue;   // Skip child nodes that are obstacles (1) or have already been visited (visits count is greater than 0), as they are not considered for selection
+            if (map.grid[position.y][position.x] == 1){
+                continue;   // Skip walls; revisits remain legal and are penalized by the rollout.
             }
             
             double score = child->getUCTScore();  // Calculate the UCT score for the current child node
@@ -604,11 +823,25 @@ struct MCTSNode{
         MCTSNode* best_node = nullptr; 
         double best_selection_score = -std::numeric_limits<double>::infinity();
 
+        Position nearest_ndlf_zero = {-1, -1};
+        int min_ndlf_dist = 999999;
+        if (map.currentNDLFRemaining() > 0) {
+            for (const auto& cell : map.current_ndlf) {
+                if (map.grid[cell.y][cell.x] == 0) {
+                    int d = std::abs(state.x - cell.x) + std::abs(state.y - cell.y);
+                    if (d < min_ndlf_dist) {
+                        min_ndlf_dist = d;
+                        nearest_ndlf_zero = cell;
+                    }
+                }
+            }
+        }
+
         for (const auto& child : children){
             const Position& position = child->state;
 
-            if (map.grid[position.y][position.x] == 1 || map.visits[position.y][position.x] > 0 || position == prev_pos){
-                continue;   // Skip child nodes that are obstacles (1) or have already been visited (visits count is greater than 0), as they are not considered for selection
+            if (map.grid[position.y][position.x] == 1){
+                continue;   // Skip walls and immediate backtracking; useful revisits remain legal.
             }
 
             bool already_planned = false;   // Flag to check if the child node's position is already part of the planned path
@@ -627,12 +860,34 @@ struct MCTSNode{
             double clearance = tsdf.getTSDFValue(position.x, position.y);
             double clearance_penalty = 0.0;
             constexpr double preferred_clearance = 2.5;
+
             if (clearance >= 0.0 && clearance < preferred_clearance){
                 double deficit = preferred_clearance - clearance;
-                clearance_penalty = 100.0 * deficit * deficit;
+                clearance_penalty = 800.0 * deficit * deficit;
+                if (clearance < 1.45){
+                    clearance_penalty += 1500.0;
+                }
             }
-            double clearance_bonus = 8.0 * std::min(clearance, 5.0);
-            double selection_score = avg_score + clearance_bonus - clearance_penalty;
+
+            double revisit_penalty = 150.0 * map.visits[position.y][position.x] * map.visits[position.y][position.x];
+
+            double target_pull = 0.0;
+            if (nearest_ndlf_zero.x != -1) {
+                double dist_now = std::hypot(state.x - nearest_ndlf_zero.x, state.y - nearest_ndlf_zero.y);
+                double dist_next = std::hypot(position.x - nearest_ndlf_zero.x, position.y - nearest_ndlf_zero.y);
+                target_pull = 120.0 * (dist_now - dist_next);
+            }
+
+            double selection_score = avg_score + target_pull - clearance_penalty - revisit_penalty;
+            // Apply the same active-NDLF lock at final action selection, not only in rollouts.
+            // Preserve useful return paths while discouraging repeated ping-ponging.
+            double exp_visits = 25.0 * (std::exp(0.8 * map.visits[position.y][position.x]) - 1.0); 
+            
+            if (position == prev_pos){
+                exp_visits += 150.0;   // Apply a penalty for backtracking to the previous position, discouraging immediate reversals in movement
+            }
+
+            selection_score -= std::min(exp_visits, 600.0);   // Penalize child nodes that have been visited more frequently, discouraging repeated visits to the same position
 
             if (best_node == nullptr || selection_score > best_selection_score){
                 best_node = child.get();
@@ -652,9 +907,7 @@ struct MCTSNode{
         for (int i = 0; i < possible_moves.size(); i++){
             
             // If the possible move leads to a tile that has already been visited, skip it
-            if (map.visits[possible_moves[i].y][possible_moves[i].x] > 0){
-                continue;   // Skip moves that lead to already visited tiles (visits count is greater than 0), as they are not considered for expansion
-            }
+                // Keep revisited cells available so the drone can return and finish an NDLF.
 
             int distance_to_frontier = 99999;   // Initialize the distance to the nearest frontier (unknown tile) to a large value
             
@@ -662,133 +915,120 @@ struct MCTSNode{
                 distance_to_frontier = std::abs(possible_moves[i].x - map.current_target.x) + std::abs(possible_moves[i].y - map.current_target.y);   // Calculate the Manhattan distance from the possible move to the current target (nearest frontier) if a valid target exists
             }
             
-            double h_bonus = 0.0;
-            if (distance_to_frontier != 99999){
-                h_bonus = 20 / (distance_to_frontier + 1);   // Calculate a heuristic bonus based on the distance to the nearest frontier (unknown tile) to encourage exploration of areas that are closer to unexplored regions
-            }
+                // Do not use a strong frontier heuristic here; the active NDLF reward controls locality.
+                double h_bonus = 0.0;
             children.push_back(std::make_unique<MCTSNode>(possible_moves[i], this, h_bonus));   // Create a new child node for each legal move and add it to the children vector, passing the current node as the parent and the calculated heuristic bonus
         }
     }
 };
 
-// Simulate the drone's movement and exploration in the environment starting from the given node for a maximum number of steps
+
 double simulateActivePerception(MCTSNode* start_node, Environment current_map, int max_steps, const TSDFMap& tsdf, std::mt19937& gen, int incoming_dx, int incoming_dy){
     if (start_node == nullptr){
-       return -99999.0; // Return a negative reward if the starting node is null, indicating that the simulation cannot proceed
+       return -99999.0;
     }
 
-    int sim_x = start_node->state.x;    // Initialize the simulated x-coordinate of the drone's position to the x-coordinate of the starting node's state
-    int sim_y = start_node->state.y;    // Initialize the simulated y-coordinate of the drone's position to the y-coordinate of the starting node's state
-    
-    if (current_map.visits[sim_y][sim_x] > 0){ // If the drone revisits a tile, apply a penalty to the total reward to discourage revisiting
-        return -99999.0; // Return a negative reward to indicate that the simulation is not favorable due to revisiting a tile
-    }
+    int sim_x = start_node->state.x;
+    int sim_y = start_node->state.y;
+    int sim_prev_x = (start_node->parent != nullptr) ? start_node->parent->state.x : -1;
+    int sim_prev_y = (start_node->parent != nullptr) ? start_node->parent->state.y : -1;
+    double total_reward = 0.0;
+    int prev_dx = incoming_dx;
+    int prev_dy = incoming_dy;
+    constexpr double gamma = 0.9;
+    constexpr double preferred_clearance = 2.5;
 
-    double total_reward = 0.0;  // Initialize the total reward accumulated during the simulation to zero
-    
-    int prev_dx = incoming_dx;    // Initialize the previous x-direction of movement to zero (no movement yet)
-    int prev_dy = incoming_dy;    // Initialize the previous y-direction of movement to zero (no movement yet)
-
-    // Simulate the drone's movement for a maximum number of steps
     for (int step = 0; step < max_steps; step++){
-        double step_reward = 0.0;   // Initialize the reward for the current step to zero
-        std::vector<Position> legal_moves = current_map.getLegalMoves(sim_x, sim_y, true, tsdf);    // Get legal moves from the current position
-
-        if (legal_moves.empty()){   // If there are no legal moves available, break the simulation loop as the drone is stuck
-            break;
-        }
-
-        std::vector<double> move_weights;   // Vector to store weights for each legal move, which will be used to bias the selection of moves based on exploration and direction
-
-        // Calculate weights for each legal move
-        for (const auto& move : legal_moves){
-            double weight = 1.0;
-
-            int move_dx = move.x - sim_x;   // Calculate the x-direction of the move relative to the current position
-            int move_dy = move.y - sim_y;   // Calculate the y-direction of the move relative to the current position
-
-            if (move_dx == prev_dx && move_dy == prev_dy){
-                weight += 15.0;  // Increase weight for moves that continue in the same direction as the previous move, encouraging the drone to maintain its heading and explore in a consistent direction
-            } else {
-                weight *=0.75;   // Decrease weight for moves that change direction, discouraging frequent changes in direction and promoting smoother exploration paths
+        // Step 0 evaluates start_node->state itself! Subsequent steps pick a neighbor first.
+        if (step > 0) {
+            std::vector<Position> legal_moves = current_map.getLegalMoves(sim_x, sim_y, true, tsdf);
+            if (legal_moves.empty()){
+                break;
             }
 
-            // Encourage the drone to move towards unknown areas
-            int unknown_count = 0;
-            // Check the 8 neighboring cells of the move position
-            for (int dx = -1; dx <= 1; ++dx){
-                for (int dy = -1; dy <= 1; ++dy){
-                    int neighbor_x = move.x + dx; // Calculate the neighbor's x-coordinate
-                    int neighbor_y = move.y + dy; // Calculate the neighbor's y-coordinate
-                    // Check if the neighbor is within bounds
-                    if (neighbor_x >= 0 && neighbor_x < current_map.getWidth() && neighbor_y >= 0 && neighbor_y < current_map.getHeight()){
-                        // Check if the neighbor cell is unknown
-                        if (current_map.grid[neighbor_y][neighbor_x] == -1){ 
-                            weight += 2.0; // Increase weight for moves that lead to unknown cells
-                            //unknown_count++;    // Increment the count of unknown neighboring cells to encourage exploration of unknown areas
-                        }
+            std::vector<double> move_weights;
+            for (const auto& move : legal_moves){
+                int prior_visits = current_map.visits[move.y][move.x];
+                Environment::CameraObservation observation = current_map.estimateCameraFOV(move.x, move.y);
+                int ndlf_prog = observation.newly_covered_ndlf;
+
+                double clearance = tsdf.getTSDFValue(move.x, move.y);
+                double clearance_pen = 0.0;
+                if (clearance >= 0.0 && clearance < preferred_clearance){
+                    double deficit = preferred_clearance - clearance;
+                    clearance_pen = 600.0 * deficit * deficit;
+                    if (clearance < 1.45) {
+                        clearance_pen += 1000.0;
                     }
                 }
+
+                double revisit_pen = 120.0 * (prior_visits + 1) * (prior_visits + 1);
+
+                //double exp_vis = 25.0 * (std::exp(0.8 * (prior_visits + 1)) - 1.0);
+                
+                double candidate_score = 400.0 * observation.newly_covered;
+                candidate_score += 800.0 * ndlf_prog;
+                candidate_score -= 20.0 * observation.overlap;
+                candidate_score -= 15.0 * observation.obstacle_overlap;
+                candidate_score -= clearance_pen;
+                candidate_score -= revisit_pen;
+                //candidate_score -= std::min(exp_vis, 600.0);
+
+                // Smooth momentum bonus to prevent zig-zagging in corridors
+                int move_dx = move.x - sim_x;
+                int move_dy = move.y - sim_y;
+                if (move_dx == prev_dx && move_dy == prev_dy) {
+                    candidate_score += 60.0;
+                }
+
+                move_weights.push_back(std::exp(std::clamp(candidate_score / 250.0, -20.0, 20.0)));
             }
 
-            auto [gradient_x, gradient_y] = tsdf.getSafetyGradient(sim_x, sim_y);
+            std::discrete_distribution<> distrib(move_weights.begin(), move_weights.end());
+            int choice = distrib(gen);
 
-            double move_length = std::sqrt(move_dx * move_dx + move_dy * move_dy);
-
-            double alignment = (move_dx * gradient_x + move_dy * gradient_y) / (move_length + 1e-6); // Calculate the alignment of the move direction with the TSDF gradient direction
-
-            double gradient_factor = std::clamp(std::exp(1.0 * alignment), 0.1, 5.0); // Calculate a factor based on the alignment of the move direction with the TSDF gradient direction, encouraging moves that align with the gradient
-
-            weight *= gradient_factor; // Adjust the weight of the move based on its alignment with the TSDF gradient, promoting exploration in directions that lead to safer or more informative areas
-
-            double destination_clearance = tsdf.getTSDFValue(move.x, move.y);
-            double clearance_factor = std::clamp(destination_clearance / 2.5, 0.25, 2.5);
-            weight *= clearance_factor * clearance_factor;
-            
-            //weight *= (1.0 + (unknown_count * 5.0)); // Increase weight for moves that lead to more unknown cells
-            move_weights.push_back(weight);
-        }
-        // discrete distribution to select a move based on weights
-        std::discrete_distribution<> distrib(move_weights.begin(), move_weights.end());
-        int choice = distrib(gen);
-
-        // Update previous direction
-        prev_dx = legal_moves[choice].x - sim_x;
-        prev_dy = legal_moves[choice].y - sim_y;
-
-        // Move to the chosen position
-        sim_x = legal_moves[choice].x;
-        sim_y = legal_moves[choice].y;
-
-        if (current_map.visits[sim_y][sim_x] > 0){ // If the drone revisits a tile, apply a penalty to the total reward to discourage revisiting
-            total_reward -= 99999.0;
-            break;  // Break the simulation loop to avoid further penalties and encourage exploration of new areas
+            sim_prev_x = sim_x;
+            sim_prev_y = sim_y;
+            prev_dx = legal_moves[choice].x - sim_x;
+            prev_dy = legal_moves[choice].y - sim_y;
+            sim_x = legal_moves[choice].x;
+            sim_y = legal_moves[choice].y;
         }
 
-        current_map.visits[sim_y][sim_x] += 1; // Increment the visit count for the new position to track how many times it has been visited during the simulation
-
-        double step_tentative_penalty = 0.0; // Initialize a tentative penalty for the current step to zero
+        double step_reward = 0.0;
+        int prior_visits = current_map.visits[sim_y][sim_x];
+        current_map.visits[sim_y][sim_x]++;
 
         double tsdf_val = tsdf.getTSDFValue(sim_x, sim_y);
         if (tsdf_val <= 0.01){
             step_reward -= 99999.0;
+            total_reward += (step_reward * std::pow(gamma, step));
             break;
-        } else if (tsdf_val < 2.5){
-            double clearance_deficit = 2.5 - tsdf_val;
-            step_tentative_penalty += clearance_deficit * clearance_deficit * 300.0; // Penalize entering the preferred wall buffer
         }
 
-        // Explore the FOV and accumulate the reward
-        double new_tiles = current_map.exploreFOV(sim_x, sim_y);
+        double clearance_penalty = 0.0;
+        if (tsdf_val < preferred_clearance){
+            double deficit = preferred_clearance - tsdf_val;
+            clearance_penalty = 600.0 * deficit * deficit;
+            if (tsdf_val < 1.45){
+                clearance_penalty += 1000.0;
+            }
+        }
 
-        current_map.updateFrontiersLocal(sim_x, sim_y);
+        int ndlf_before = current_map.currentNDLFRemaining();
+        Environment::CameraObservation observation = current_map.observeCameraFOV(sim_x, sim_y);
+        int ndlf_after = current_map.currentNDLFRemaining();
+        double ndlf_progress = ndlf_before - ndlf_after;
+        double revisit_pen = 120.0 * prior_visits * prior_visits;
 
-        step_reward += (new_tiles * 20.0); // reward for discovering new tiles
-        step_reward -= 1.0; // small penalty for each step to encourage shorter paths
+        step_reward += 400.0 * observation.newly_covered;
+        step_reward += 800.0 * ndlf_progress;
+        step_reward -= 20.0 * observation.overlap;
+        step_reward -= 15.0 * observation.obstacle_overlap;
+        step_reward -= clearance_penalty;
+        step_reward -= revisit_pen;
+        step_reward -= 25.0; // Base step tax
 
-        step_reward -= (step_tentative_penalty); // penalty for being near previously visited tiles
-    
-        double gamma = 0.9; // discount factor for future rewards
         total_reward += (step_reward * std::pow(gamma, step));
     }
     return total_reward;
@@ -956,14 +1196,14 @@ void runRootActionRollouts(MCTSNode& root, Environment& map, const TSDFMap& tsdf
 
 int main(){
     // initialisation
-    int width, height, start_x, start_y, ui_fov;
+    int width, height, start_x, start_y, ui_fov, camera_fov;
     int threshold = 7; 
     Position prev_pos = {-1, -1};
 
-    if (!(std::cin >> width >> height >> start_x >> start_y >> ui_fov) ) return 0;
+    if (!(std::cin >> width >> height >> start_x >> start_y >> ui_fov >> camera_fov) ) return 0;
 
-    Environment true_map(width, height, 0, ui_fov);
-    Environment known_map(width, height, -1, ui_fov);
+    Environment true_map(width, height, 0, ui_fov, camera_fov);
+    Environment known_map(width, height, -1, ui_fov, camera_fov);
     Position drone_pos ={start_x, start_y};
     TSDFMap tsdf(width, height, 5.0);
 
@@ -983,16 +1223,27 @@ int main(){
     std::cout << "MAP LOADED. STARTING LOOP...\n" << std::flush;
 
     // Initialize the very first FOV and frontiers before the loop starts
-    std::vector<Position> init_walls = known_map.updateFOV(drone_pos.x, drone_pos.y, true_map.grid);
+    // Bootstrap the first NDLF from the initial LIDAR observation.
+    std::vector<Position> init_walls = known_map.updateLidarFOV(drone_pos.x, drone_pos.y, true_map.grid);
     tsdf.updateTSDF(init_walls);
+    known_map.initializeCurrentNDLF(drone_pos);
+    known_map.observeCameraFOV(drone_pos.x, drone_pos.y);
     tsdf.TSDFToVisualiser();
-    known_map.updateFrontiersLocal(drone_pos.x, drone_pos.y);
+    known_map.rebuildFrontiers();
+    // Stream the initial NDLF status before the first planning cycle.
+    std::cout << "NDLF " << known_map.current_ndlf_id << " "
+              << known_map.currentNDLFRemaining() << " ";
+    for (const Position& cell : known_map.current_ndlf){
+        std::cout << cell.x << " " << cell.y << " ";
+    }
+    std::cout << "\n" << std::flush;
 
     std::deque<Position> current_plan; // The multi-step execution queue
     std::vector<Position> escape_path; // Holds the remaining A* steps between planning phases
     std::unique_ptr<MCTSNode> mcts_root = nullptr; // Initialize the MCTS root node to nullptr
     bool mcts_failed = false;
 
+    std::cout << drone_pos.x << " " << drone_pos.y << "\n" << std::flush;
     // game loop
     for (int game_step = 0; game_step < max_game_steps; game_step++){
         
@@ -1006,35 +1257,81 @@ int main(){
         // Only run CPU-heavy tasks if the drone has no moves in its queue
         if (current_plan.empty()) {
             known_map.updateTargetLock(drone_pos.x, drone_pos.y);
-            bool is_surrounded = known_map.isSurrounded(drone_pos.x, drone_pos.y, tsdf);
+
+            if (!escape_path.empty()){
+                int dest_x = escape_path.back().x;
+                int dest_y = escape_path.back().y;
+                if (known_map.grid[dest_y][dest_x] == 1 || known_map.grid[dest_y][dest_x] == 2){
+                    escape_path.clear(); // Clear the escape path if the destination is now blocked or already explored
+                    std::cout << "ASTAR_PATH \n" << std::flush; // Erase finished leash in visualizer
+                }
+            }
+
+            bool needs_transit = false;
+
+            if (escape_path.empty() && known_map.currentNDLFRemaining() > 0){
+                int closest_ndlf = 999999;
+                for (const auto& cell : known_map.current_ndlf){
+                    if (known_map.grid[cell.y][cell.x] == 0){
+                        int distance = std::abs(drone_pos.x - cell.x) + std::abs(drone_pos.y - cell.y);
+                        if (distance < closest_ndlf){
+                            closest_ndlf = distance;
+                        }
+                    }
+                }
+                if (closest_ndlf > 5){
+                    needs_transit = true; // The drone is too far from the current NDLF, so it needs to transit to it
+                }
+            }
             
             // Check if we need to trigger A* (surrounded, boredom, or continuing an existing escape path)
-            if (is_surrounded || !escape_path.empty() || mcts_failed) {
+            if (known_map.currentNDLFRemaining() == 0 || needs_transit ||!escape_path.empty() || mcts_failed) {
                 mcts_failed = false;
                 // If we don't already have an active escape path, calculate one
                 if (escape_path.empty()) {
                     bool path_found = false;
 
-                    while (!known_map.active_frontiers.empty()) {
-                        Position target_frontier = known_map.getNearestFrontier(drone_pos);
-
-                        if (target_frontier.x == -1) break; // No valid frontiers found, exit the loop
-                        
-                        if (target_frontier == drone_pos){
-                            known_map.active_frontiers.erase(target_frontier);
-                            continue; // Skip to the next iteration if the target frontier is the same as the drone's current position
+                    if (known_map.currentNDLFRemaining() > 0){
+                        Position best_ndlf_target = {-1, -1};
+                        int best_ndlf_distance = 99999;
+                        for (const auto& cell : known_map.current_ndlf){
+                            if (known_map.grid[cell.y][cell.x] == 0){
+                                // This cell is in the current NDLF and has not been covered
+                                int distance = std::abs(drone_pos.x - cell.x) + std::abs(drone_pos.y - cell.y);
+                                if (distance < best_ndlf_distance){
+                                    best_ndlf_distance = distance;
+                                    best_ndlf_target = cell;
+                                }
+                            }
                         }
-                        
-                        escape_path = calculateAStar(drone_pos, target_frontier, known_map, tsdf);
-
-                        if (!escape_path.empty()){
-                            path_found = true;
-                            break; // Exit the loop if a valid escape path is found
-                        } else {
-                            known_map.active_frontiers.erase(target_frontier);
+                        if (best_ndlf_target.x != -1){
+                            escape_path = calculateAStar(drone_pos, best_ndlf_target, known_map, tsdf);
+                            if (!escape_path.empty()){
+                                path_found = true;
+                            }
                         }
+                    }
+
+                    // Attempt to find a path to the nearest frontier using A*
+                    if (!path_found) {
+                        while (!known_map.active_frontiers.empty()) {
+                            Position target_frontier_retry = known_map.getNearestFrontier(drone_pos);
+                            if (target_frontier_retry.x == -1) break; // No valid frontiers found, exit the loop
+                            
+                            if (target_frontier_retry == drone_pos){
+                                known_map.active_frontiers.erase(target_frontier_retry);
+                                continue; // Skip to the next iteration if the target frontier is the same as the drone's current position
+                            }
+                            escape_path = calculateAStar(drone_pos, target_frontier_retry, known_map, tsdf);
                         
-                    } 
+                            if (!escape_path.empty()){
+                                path_found = true;
+                                break; // Exit the loop if a valid escape path is found
+                            } else {
+                                known_map.active_frontiers.erase(target_frontier_retry);
+                            }
+                        }
+                    }
                         
                     // Failsafe global scan if local frontiers fail
                     if (!path_found) {
@@ -1063,20 +1360,12 @@ int main(){
                         break; // Exit the main loop if no escape path can be found
                     }
                     
-                    if (!escape_path.empty()) {
-                        std::cout << "[C++] GOING TO FRONTIER " << escape_path.back().x << ", " << escape_path.back().y << " \n" << std::flush;
-                    } else {
-                        std::cout << "STUCK\n" << std::flush;
-                        break;
-                    }
+                    std::cout << "[C++] GOING TO FRONTIER " << escape_path.back().x << ", " << escape_path.back().y << " \n" << std::flush;
                 }
 
-                // Push up to 3 steps of the A* path into the current execution plan to maintain sync
-                int steps_to_push = std::min((int)escape_path.size(), 3);
-                for (int i = 0; i < steps_to_push; ++i) {
-                    current_plan.push_back(escape_path[0]);
-                    escape_path.erase(escape_path.begin());
-                }
+                current_plan.push_back(escape_path[0]);
+                escape_path.erase(escape_path.begin());
+                
 
                 std::cout << "ASTAR_PATH ";
                 for (const auto& pos : escape_path) {
@@ -1086,12 +1375,8 @@ int main(){
                 
             } else {
                 // RUN PERSISTENT MCTS 
-                if (!mcts_root){
-                    mcts_root = std::make_unique<MCTSNode>(drone_pos);
-                }
-                if (mcts_root->children.empty()){
-                    mcts_root->expandNode(known_map, tsdf);
-                }
+                mcts_root = std::make_unique<MCTSNode>(drone_pos);
+                mcts_root->expandNode(known_map, tsdf);
 
                 std::mt19937 sim_gen(std::random_device{}()); // Initialize a Mersenne Twister random number
                 int curr_heading_x = (prev_pos.x != -1) ? (drone_pos.x - prev_pos.x) : 0; // Calculate the current heading in the x-direction based on the previous position
@@ -1100,7 +1385,7 @@ int main(){
 
                 MCTSNode* next_node = mcts_root->getBestRealChild(known_map, tsdf, prev_pos);
 
-                if (next_node != nullptr && (known_map.visits[next_node->state.y][next_node->state.x] == 0)){
+                if (next_node != nullptr){ // && (known_map.visits[next_node->state.y][next_node->state.x] == 0)){
                     current_plan.push_back(next_node->state);   
                 }
 
@@ -1120,7 +1405,6 @@ int main(){
                 std::cout << "\n" << std::flush;
             }
         }
-
         // --- PHASE 2: EXECUTION ---
         if (!current_plan.empty()) {
             Position next_step = current_plan.front();
@@ -1140,22 +1424,25 @@ int main(){
             prev_pos = drone_pos;
             drone_pos = next_step;
 
-            if (mcts_root){
-                mcts_root = mcts_root->extractChild(drone_pos); // Move the MCTS root to the child corresponding to the new drone position
-            }
-            if (!escape_path.empty()){
-                mcts_root.reset(); // Reset the MCTS root if we are following an A* escape path to avoid conflicts
-            }
+            mcts_root.reset(); // Reset the MCTS root if we are following an A* escape path to avoid conflicts            
             
             known_map.visits[drone_pos.y][drone_pos.x] += 1;
             
             // IMPORTANT: Update sensors IMMEDIATELY after taking the physical step
-            std::vector<Position> new_walls = known_map.updateFOV(drone_pos.x, drone_pos.y, true_map.grid);
+            // Update LIDAR first, then camera coverage, then advance the NDLF sequence if complete.
+            std::vector<Position> new_walls = known_map.updateLidarFOV(drone_pos.x, drone_pos.y, true_map.grid);
             tsdf.updateTSDF(new_walls);
+            known_map.observeCameraFOV(drone_pos.x, drone_pos.y);
+            known_map.activateNextNDLF(drone_pos);
+            // Stream the active NDLF so the visualizer can highlight the current pocket.
+            std::cout << "NDLF " << known_map.current_ndlf_id << " "
+                      << known_map.currentNDLFRemaining() << " ";
+            for (const Position& cell : known_map.current_ndlf){
+                std::cout << cell.x << " " << cell.y << " ";
+            }
+            std::cout << "\n" << std::flush;
             tsdf.TSDFToVisualiser();
-            //known_map.fillFOVHoles(drone_pos.x, drone_pos.y);
-            known_map.updateFrontiersLocal(drone_pos.x, drone_pos.y);
-            known_map.scanGlobalFrontiers();
+            known_map.rebuildFrontiers();
             
             std::cout << drone_pos.x << " " << drone_pos.y << "\n" << std::flush;
 

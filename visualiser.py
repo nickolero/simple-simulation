@@ -15,6 +15,7 @@ class DroneVisualizer:
         self.drone_pos = (0, 0)
         self.running = False
         self.frontiers = set() 
+        self.ndlf = set()
         
         self.ui_queue = queue.Queue()
         
@@ -66,6 +67,11 @@ class DroneVisualizer:
         self.fov_slider.set(4)
         self.fov_slider.grid(row=0, column=13, padx=10)
 
+        # Camera FOV control is sent to C++ and drives the local coverage overlay.
+        self.camera_fov_slider = tk.Scale(control_frame, from_=1, to=5, orient=tk.HORIZONTAL, label="Camera FOV", resolution=1)
+        self.camera_fov_slider.set(2)
+        self.camera_fov_slider.grid(row=0, column=14, padx=10)
+
         # --- The Canvas ---
         self.canvas = tk.Canvas(root, bg="white")
         self.canvas.pack(pady=5)
@@ -92,7 +98,9 @@ class DroneVisualizer:
         self.grid = [[0 for _ in range(self.width)] for _ in range(self.height)]
         self.visit_counts = [[0 for _ in range(self.width)] for _ in range(self.height)]
         self.explored = [[False for _ in range(self.width)] for _ in range(self.height)]
+        self.camera_explored = [[False for _ in range(self.width)] for _ in range(self.height)]
         self.frontiers = set() 
+        self.ndlf = set()
         
         self.drone_pos = (0, 0)
         self.visit_counts[0][0] = 1 
@@ -172,19 +180,18 @@ class DroneVisualizer:
                         # Gradient from Red (Danger) to White (Safe)
                         intensity = int((val / 5.0) * 255)
                         color = f"#ff{intensity:02x}{intensity:02x}"
-                else:
-                    # --- Standard Exploration Colors ---
-                    if self.grid[y][x] == 1:
-                        color = "#333333"
-                    elif self.visit_counts[y][x] > 0:
-                        color = "#a8f0b1"
-                    elif self.explored[y][x]:
-                        color = "#fffac8"
+                elif self.visit_counts[y][x] > 0 or self.explored[y][x]:
+                    color = "#a8f0b1"
 
-                
-                
-                if hasattr(self, 'frontiers') and (x, y) in self.frontiers:
+                # Mission overlays have a fixed priority over the base/TSDF layer.
+                if self.grid[y][x] == 1:
+                    color = "#333333"
+                elif (x, y) in self.frontiers:
                     color = "#c084fc"
+                elif (x, y) in self.ndlf:
+                    color = "#ffb000"
+                elif self.camera_explored[y][x]:
+                    color = "#a8d8ff"
                     
                 self.canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="#e5e7eb" if self.tile_size < 15 else "gray")
                 
@@ -197,32 +204,32 @@ class DroneVisualizer:
                     pad = max(2, self.tile_size // 8)
                     self.canvas.create_oval(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill="blue")
 
-                if hasattr(self, 'mcts_plan') and self.mcts_plan:
-                    line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
-                                self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
-                    for i in range(0, len(self.mcts_plan) - 1, 2):
-                        px, py = self.mcts_plan[i], self.mcts_plan[i+1]
-                        line_points.extend([px * self.tile_size + (self.tile_size / 2), py * self.tile_size + (self.tile_size / 2)])
-                        x1, y1 = px * self.tile_size, py * self.tile_size
-                        x2, y2 = x1 + self.tile_size, y1 + self.tile_size
-                        pad = max(2, self.tile_size // 4)
-                        self.canvas.create_rectangle(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill="red", tags="plan")
-                    if len(line_points) >= 4:
-                        self.canvas.create_line(line_points, fill="red", width=2, tags="plan")
+        if hasattr(self, 'mcts_plan') and self.mcts_plan:
+            line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
+                        self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
+            for i in range(0, len(self.mcts_plan) - 1, 2):
+                px, py = self.mcts_plan[i], self.mcts_plan[i+1]
+                line_points.extend([px * self.tile_size + (self.tile_size / 2), py * self.tile_size + (self.tile_size / 2)])
+                x1, y1 = px * self.tile_size, py * self.tile_size
+                x2, y2 = x1 + self.tile_size, y1 + self.tile_size
+                pad = max(2, self.tile_size // 4)
+                self.canvas.create_rectangle(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill="red", tags="plan")
+            if len(line_points) >= 4:
+                self.canvas.create_line(line_points, fill="red", width=2, tags="plan")
 
-                if hasattr(self, 'astar_plan') and self.astar_plan:
-                    # 1. Anchor the start of the line exactly to the drone's center
-                    line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
-                                self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
-                    
-                    # 2. Add all the remaining A* escape coordinates
-                    for i in range(0, len(self.astar_plan), 2):
-                        px, py = self.astar_plan[i], self.astar_plan[i+1]
-                        line_points.extend([px * self.tile_size + (self.tile_size / 2), py * self.tile_size + (self.tile_size / 2)])
-                        
-                    if len(line_points) >= 4:
-                        # 3. Draw it as a thick brown dotted line
-                        self.canvas.create_line(line_points, fill="#8B4513", width=3, dash=(2, 4), tags="astar_plan")
+        if hasattr(self, 'astar_plan') and self.astar_plan:
+            # 1. Anchor the start of the line exactly to the drone's center
+            line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
+                        self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
+            
+            # 2. Add all the remaining A* escape coordinates
+            for i in range(0, len(self.astar_plan), 2):
+                px, py = self.astar_plan[i], self.astar_plan[i+1]
+                line_points.extend([px * self.tile_size + (self.tile_size / 2), py * self.tile_size + (self.tile_size / 2)])
+                
+            if len(line_points) >= 4:
+                # 3. Draw it as a thick brown dotted line
+                self.canvas.create_line(line_points, fill="#8B4513", width=3, dash=(2, 4), tags="astar_plan")
 
     def toggle_obstacle(self, event):
         if self.running: return 
@@ -259,7 +266,7 @@ class DroneVisualizer:
             if e2 < dx:
                 err += dx
                 y0 += sy
-            if x0 != prev_x or y0 != prev_y:
+            if x0 != prev_x and y0 != prev_y:
                 if self.grid[prev_y][x0] == 1 or self.grid[y0][prev_x] == 1: return False
 
     def process_queue(self):
@@ -270,17 +277,20 @@ class DroneVisualizer:
                 if msg_type == "FRONTIERS":
                     self.frontiers = data
                     self.draw_grid()
+                elif msg_type == "NDLF":
+                    self.ndlf = data
+                    self.draw_grid()
                 elif msg_type == "TSDF":
                     # Reshape the flat 1D list back into a 2D grid matrix
                     self.tsdf_grid = [data[i * self.width:(i + 1) * self.width] for i in range(self.height)]
                     self.draw_grid()
                 elif msg_type == "ASTAR":
                     self.astar_plan = data
-                    #self.mcts_plan = [] 
+                    self.mcts_plan = [] 
                     self.draw_grid()    
                 elif msg_type == "PATH":
                     self.mcts_plan = data
-                    #self.astar_plan = [] 
+                    self.astar_plan = [] 
                     self.draw_grid()
                         
                 elif msg_type == "MOVE":
@@ -297,6 +307,18 @@ class DroneVisualizer:
                             if 0 <= ex < self.width and 0 <= ey < self.height:
                                 if self.has_line_of_sight(new_x, new_y, ex, ey):
                                     self.explored[ey][ex] = True
+
+                    # Mirror the smaller camera sensor locally for the coverage layer.
+                    camera_radius = self.camera_fov_slider.get()
+                    camera_radius_squared = camera_radius ** 2
+                    for dy in range(-camera_radius, camera_radius + 1):
+                        for dx in range(-camera_radius, camera_radius + 1):
+                            if (dx ** 2 + dy ** 2) > camera_radius_squared:
+                                continue
+                            ex, ey = new_x + dx, new_y + dy
+                            if 0 <= ex < self.width and 0 <= ey < self.height:
+                                if self.has_line_of_sight(new_x, new_y, ex, ey):
+                                    self.camera_explored[ey][ex] = True
                     self.draw_grid()
                     
                     # DECOUPLING MAGIC: Stop processing the queue and wait based on the slider value!
@@ -323,7 +345,7 @@ class DroneVisualizer:
 
     def run_cpp_brain(self):
         process = subprocess.Popen(['./drone'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        setup_data = f"{self.width} {self.height} {self.drone_pos[0]} {self.drone_pos[1]} {self.fov_slider.get()}\n"
+        setup_data = f"{self.width} {self.height} {self.drone_pos[0]} {self.drone_pos[1]} {self.fov_slider.get()} {self.camera_fov_slider.get()}\n"
         for row in self.grid:
             setup_data += " ".join(map(str, row)) + "\n"
         process.stdin.write(setup_data)
@@ -338,6 +360,17 @@ class DroneVisualizer:
                 for i in range(0, len(coords), 2):
                     frontier_set.add((coords[i], coords[i+1]))
                 self.ui_queue.put(("FRONTIERS", frontier_set))
+                continue
+            if line.startswith("NDLF"):
+                values = list(map(int, line.split()[1:]))
+                ndlf_id = values[0] if values else 0
+                remaining = values[1] if len(values) > 1 else 0
+                coords = values[2:]
+                ndlf_set = set()
+                for i in range(0, len(coords), 2):
+                    ndlf_set.add((coords[i], coords[i + 1]))
+                self.ui_queue.put(("NDLF", ndlf_set))
+                self.ui_queue.put(("PRINT", f"NDLF {ndlf_id}: {remaining} uncovered cells"))
                 continue
             if line.startswith("ASTAR_PATH"):
                 coords = list(map(int, line.split()[1:]))
@@ -361,7 +394,7 @@ class DroneVisualizer:
                 self.ui_queue.put(("MOVE", (new_x, new_y)))
                 # REMOVED: time.sleep(0.04) -> C++ now runs at maximum speed!
             else:
-                if not line.startswith("PATH") and not line.startswith("ASTAR_PATH") and not line.startswith("FRONTIERS"):
+                if not line.startswith("PATH") and not line.startswith("ASTAR_PATH") and not line.startswith("FRONTIERS") and not line.startswith("NDLF"):
                     self.ui_queue.put(("PRINT", line))
 
 if __name__ == "__main__":
