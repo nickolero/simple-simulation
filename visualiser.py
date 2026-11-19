@@ -2,31 +2,62 @@ import tkinter as tk
 import subprocess
 import threading
 import random
-import queue 
+import queue
+
 
 class DroneVisualizer:
+    DRONE_COLORS = [
+        "#1d4ed8",  # 0: Royal Blue
+        "#dc2626",  # 1: Crimson Red
+        "#7c3aed",  # 2: Vivid Violet
+        "#0d9488",  # 3: Teal
+        "#d97706",  # 4: Amber
+        "#db2777",  # 5: Magenta
+        "#4f46e5",  # 6: Indigo
+        "#059669",  # 7: Emerald
+    ]
+
+    # Lighter pastel tints for each drone's 8 candidate sparse paths
+    DRONE_LIGHT_COLORS = [
+        "#93c5fd",  # 0: Light Blue
+        "#fca5a5",  # 1: Light Red
+        "#c4b5fd",  # 2: Light Violet
+        "#5eead4",  # 3: Light Teal
+        "#fcd34d",  # 4: Light Amber
+        "#f9a8d4",  # 5: Light Pink
+        "#a5b4fc",  # 6: Light Indigo
+        "#6ee7b7",  # 7: Light Emerald
+    ]
+
     def __init__(self, root):
         self.root = root
-        self.root.title("MCTS Drone - Active Frontiers")
-        
+        self.root.title("Dec-MCTS Multi-UAV - Active Frontiers, SaR & Checkpoints")
+
         self.width = 30
         self.height = 30
-        self.max_canvas_dim = 700 
-        self.drone_pos = (0, 0)
+        self.max_canvas_dim = 700
+        self.drone_positions = [(0, 0)]
+        self.launch_positions = [(0, 0)]
         self.running = False
-        self.frontiers = set() 
-        
+        self.frontiers = set()
+        self.found_sar = set()
+        self.found_cp = set()
+        self.mcts_plans = {}
+        self.best_full_plans = {}
+        self.sparse_plans = {}
+        self.astar_plans = {}
+
         self.ui_queue = queue.Queue()
-        
-        # --- Top Control Panel ---
+
+        # --- Top Control Panel (Row 0: Map & Sensors) ---
         control_frame = tk.Frame(root)
-        control_frame.pack(pady=8)
-        
+        control_frame.pack(pady=4)
+
         tk.Label(control_frame, text="W:").grid(row=0, column=0)
         self.width_input = tk.Entry(control_frame, width=4)
         self.width_input.insert(0, str(self.width))
         self.width_input.grid(row=0, column=1, padx=2)
-        
+
         tk.Label(control_frame, text="H:").grid(row=0, column=2)
         self.height_input = tk.Entry(control_frame, width=4)
         self.height_input.insert(0, str(self.height))
@@ -41,67 +72,169 @@ class DroneVisualizer:
         self.block_size_input = tk.Entry(control_frame, width=3)
         self.block_size_input.insert(0, "3")
         self.block_size_input.grid(row=0, column=7, padx=2)
-        
+
         self.apply_btn = tk.Button(control_frame, text="Resize", command=self.apply_new_size)
         self.apply_btn.grid(row=0, column=8, padx=4)
 
         self.gen_btn = tk.Button(control_frame, text="Generate Map", command=self.generate_random_map)
         self.gen_btn.grid(row=0, column=9, padx=4)
-        
+
         self.start_btn = tk.Button(control_frame, text="Start Simulation", command=self.start_simulation, bg="#bbf7d0")
         self.start_btn.grid(row=0, column=10, padx=6)
-        
-        # NEW: Playback Speed Slider
-        self.speed_slider = tk.Scale(control_frame, from_=5, to=500, orient=tk.HORIZONTAL, label="Delay (ms)", resolution=5)
-        self.speed_slider.set(100)
-        self.speed_slider.grid(row=0, column=11, padx=10)
 
-        # NEW: TSDF Toggle Checkbox
+        self.speed_slider = tk.Scale(control_frame, from_=5, to=1000, orient=tk.HORIZONTAL, label="Delay (ms)", resolution=5)
+        self.speed_slider.set(100)
+        self.speed_slider.grid(row=0, column=11, padx=8)
+
         self.show_tsdf = tk.BooleanVar(value=False)
         self.tsdf_btn = tk.Checkbutton(control_frame, text="Show TSDF", variable=self.show_tsdf, command=self.draw_grid)
-        self.tsdf_btn.grid(row=0, column=12, padx=6)
+        self.tsdf_btn.grid(row=0, column=12, padx=4)
 
-        # NEW: FOV Radius Slider
         self.fov_slider = tk.Scale(control_frame, from_=2, to=10, orient=tk.HORIZONTAL, label="FOV", resolution=1)
-        self.fov_slider.set(4)
-        self.fov_slider.grid(row=0, column=13, padx=10)
+        self.fov_slider.set(7)
+        self.fov_slider.grid(row=0, column=13, padx=8)
+
+        self.camera_fov_slider = tk.Scale(control_frame, from_=1, to=5, orient=tk.HORIZONTAL, label="Camera FOV", resolution=1)
+        self.camera_fov_slider.set(3)
+        self.camera_fov_slider.grid(row=0, column=14, padx=8)
+
+        # --- Second Control Panel (Row 1: UAV Placement, SaR, Checkpoints & Path Debuggers) ---
+        mission_frame = tk.Frame(root)
+        mission_frame.pack(pady=4)
+
+        self.uav_mode = tk.BooleanVar(value=False)
+        self.uav_cb = tk.Checkbutton(
+            mission_frame, text="UAVs", variable=self.uav_mode,
+            font=("Arial", 10, "bold"), fg="#1d4ed8"
+        )
+        self.uav_cb.grid(row=0, column=0, padx=(4, 6))
+
+        tk.Label(mission_frame, text="|").grid(row=0, column=1, padx=4)
+
+        # SaR Controls (Grid value = 3)
+        self.sar_enabled = tk.BooleanVar(value=False)
+        self.sar_cb = tk.Checkbutton(mission_frame, text="SaR", variable=self.sar_enabled, font=("Arial", 10, "bold"))
+        self.sar_cb.grid(row=0, column=2, padx=(4, 2))
+
+        tk.Label(mission_frame, text="Qty:").grid(row=0, column=3)
+        self.sar_qty_input = tk.Entry(mission_frame, width=3)
+        self.sar_qty_input.insert(0, "3")
+        self.sar_qty_input.grid(row=0, column=4, padx=2)
+
+        self.sar_rtl = tk.BooleanVar(value=True)
+        self.sar_rtl_cb = tk.Checkbutton(mission_frame, text="RTL", variable=self.sar_rtl)
+        self.sar_rtl_cb.grid(row=0, column=5, padx=(2, 8))
+
+        tk.Label(mission_frame, text="|").grid(row=0, column=6, padx=4)
+
+        # Checkpoints Controls (Grid value = 4)
+        self.cp_enabled = tk.BooleanVar(value=False)
+        self.cp_cb = tk.Checkbutton(mission_frame, text="Checkpoints", variable=self.cp_enabled, font=("Arial", 10, "bold"))
+        self.cp_cb.grid(row=0, column=7, padx=(4, 2))
+
+        tk.Label(mission_frame, text="Qty:").grid(row=0, column=8)
+        self.cp_qty_input = tk.Entry(mission_frame, width=3)
+        self.cp_qty_input.insert(0, "3")
+        self.cp_qty_input.grid(row=0, column=9, padx=2)
+
+        self.cp_coords = tk.BooleanVar(value=True)
+        self.cp_coords_cb = tk.Checkbutton(mission_frame, text="Coordinates", variable=self.cp_coords)
+        self.cp_coords_cb.grid(row=0, column=10, padx=2)
+
+        self.cp_rtl = tk.BooleanVar(value=True)
+        self.cp_rtl_cb = tk.Checkbutton(mission_frame, text="RTL", variable=self.cp_rtl)
+        self.cp_rtl_cb.grid(row=0, column=11, padx=(2, 8))
+
+        tk.Label(mission_frame, text="|").grid(row=0, column=12, padx=4)
+
+        # New Rollout Visualization Checkboxes
+        self.show_best_path = tk.BooleanVar(value=False)
+        self.best_path_cb = tk.Checkbutton(
+            mission_frame, text="Best Path (10)", variable=self.show_best_path,
+            command=self.draw_grid, font=("Arial", 9, "bold"), fg="#b91c1c"
+        )
+        self.best_path_cb.grid(row=0, column=13, padx=4)
+
+        self.show_all_paths = tk.BooleanVar(value=False)
+        self.all_paths_cb = tk.Checkbutton(
+            mission_frame, text="All Paths (8)", variable=self.show_all_paths,
+            command=self.draw_grid, font=("Arial", 9, "bold"), fg="#6d28d9"
+        )
+        self.all_paths_cb.grid(row=0, column=14, padx=4)
 
         # --- The Canvas ---
         self.canvas = tk.Canvas(root, bg="white")
         self.canvas.pack(pady=5)
-        self.canvas.bind("<Button-1>", self.toggle_obstacle)
-        
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+
         self.apply_new_size()
 
     def calculate_tile_size(self):
         self.tile_size = max(8, min(self.max_canvas_dim // self.width, self.max_canvas_dim // self.height))
 
     def apply_new_size(self):
-        if self.running: return 
-        
+        if self.running:
+            return
+
         try:
             new_w = int(self.width_input.get())
             new_h = int(self.height_input.get())
-            if new_w < 5 or new_h < 5: return
+            if new_w < 5 or new_h < 5:
+                return
             self.width = new_w
             self.height = new_h
         except ValueError:
-            return 
-            
+            return
+
         self.calculate_tile_size()
         self.grid = [[0 for _ in range(self.width)] for _ in range(self.height)]
         self.visit_counts = [[0 for _ in range(self.width)] for _ in range(self.height)]
         self.explored = [[False for _ in range(self.width)] for _ in range(self.height)]
-        self.frontiers = set() 
-        
-        self.drone_pos = (0, 0)
-        self.visit_counts[0][0] = 1 
-        
+        self.camera_explored = [[False for _ in range(self.width)] for _ in range(self.height)]
+        self.frontiers = set()
+        self.found_sar = set()
+        self.found_cp = set()
+        self.mcts_plans = {}
+        self.best_full_plans = {}
+        self.sparse_plans = {}
+        self.astar_plans = {}
+
+        self.drone_positions = [(0, 0)]
+        self.launch_positions = [(0, 0)]
+
         self.canvas.config(width=self.width * self.tile_size, height=self.height * self.tile_size)
         self.draw_grid()
 
+    def is_near_any_drone(self, x, y, buffer_dist=2):
+        for dx, dy in self.drone_positions:
+            if max(abs(x - dx), abs(y - dy)) <= buffer_dist:
+                return True
+        return False
+
+    def place_random_objects(self, tile_value, count):
+        candidates = []
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.is_near_any_drone(x, y, 2):
+                    continue
+                if self.grid[y][x] != 0:
+                    continue
+                has_free_neighbor = False
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < self.width and 0 <= ny < self.height and self.grid[ny][nx] == 0:
+                        has_free_neighbor = True
+                        break
+                if has_free_neighbor:
+                    candidates.append((x, y))
+
+        random.shuffle(candidates)
+        for x, y in candidates[:max(0, count)]:
+            self.grid[y][x] = tile_value
+
     def generate_random_map(self):
-        if self.running: return
+        if self.running:
+            return
         self.apply_new_size()
 
         try:
@@ -115,8 +248,8 @@ class DroneVisualizer:
         except ValueError:
             block_size = 3
 
-        macro_density = density * 1.0  
-        micro_density = density * 0.0  
+        macro_density = density * 1.0
+        micro_density = density * 0.0
 
         coarse_w = self.width // block_size
         coarse_h = self.height // block_size
@@ -124,7 +257,7 @@ class DroneVisualizer:
 
         for cy in range(coarse_h):
             for cx in range(coarse_w):
-                if max(abs(cx - 0), abs(cy - 0)) <= 1: 
+                if max(abs(cx - 0), abs(cy - 0)) <= 1:
                     continue
                 if random.random() < macro_density:
                     coarse_grid[cy][cx] = 1
@@ -136,11 +269,11 @@ class DroneVisualizer:
                 if cy < coarse_h and cx < coarse_w:
                     self.grid[y][x] = coarse_grid[cy][cx]
                 else:
-                    self.grid[y][x] = 1 
+                    self.grid[y][x] = 1
 
         for y in range(self.height):
             for x in range(self.width):
-                if max(abs(x - 0), abs(y - 0)) <= 2: 
+                if max(abs(x - 0), abs(y - 0)) <= 2:
                     continue
                 if self.grid[y][x] == 0 and random.random() < micro_density:
                     self.grid[y][x] = 1
@@ -148,98 +281,271 @@ class DroneVisualizer:
         self.grid[0][0] = 0
         self.grid[0][1] = 0
         self.grid[1][0] = 0
-        self.grid[1][1] = 0 
+        self.grid[1][1] = 0
+
+        if self.sar_enabled.get():
+            try:
+                sar_qty = int(self.sar_qty_input.get())
+            except ValueError:
+                sar_qty = 0
+            self.place_random_objects(3, sar_qty)
+
+        if self.cp_enabled.get():
+            try:
+                cp_qty = int(self.cp_qty_input.get())
+            except ValueError:
+                cp_qty = 0
+            self.place_random_objects(4, cp_qty)
+
         self.draw_grid()
 
     def draw_grid(self):
         self.canvas.delete("all")
-        show_numbers = self.tile_size >= 24  
+        show_numbers = self.tile_size >= 20
 
         for y in range(self.height):
             for x in range(self.width):
                 x1, y1 = x * self.tile_size, y * self.tile_size
                 x2, y2 = x1 + self.tile_size, y1 + self.tile_size
-                
+
+                tile_val = self.grid[y][x]
                 color = "white"
-                # --- NEW: TSDF Heatmap Override ---
+
                 if self.show_tsdf.get() and hasattr(self, 'tsdf_grid') and self.tsdf_grid:
                     val = self.tsdf_grid[y][x]
                     if val <= 0.0:
-                        color = "#333333" # Solid Wall
+                        color = "#333333"
                     elif val >= 5.0:
-                        color = "white"   # Safe Space
+                        color = "white"
                     else:
-                        # Gradient from Red (Danger) to White (Safe)
                         intensity = int((val / 5.0) * 255)
                         color = f"#ff{intensity:02x}{intensity:02x}"
-                else:
-                    # --- Standard Exploration Colors ---
-                    if self.grid[y][x] == 1:
-                        color = "#333333"
-                    elif self.visit_counts[y][x] > 0:
-                        color = "#a8f0b1"
-                    elif self.explored[y][x]:
-                        color = "#fffac8"
+                elif self.visit_counts[y][x] > 0 or self.explored[y][x]:
+                    color = "#a8f0b1"
 
-                
-                
-                if hasattr(self, 'frontiers') and (x, y) in self.frontiers:
+                if (x, y) in self.frontiers:
                     color = "#c084fc"
-                    
-                self.canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="#e5e7eb" if self.tile_size < 15 else "gray")
-                
-                if show_numbers and self.visit_counts[y][x] > 0 and self.grid[y][x] == 0:
+                elif self.camera_explored[y][x]:
+                    color = "#a8d8ff"
+
+                if tile_val == 1:
+                    color = "#333333"
+                elif tile_val == 3:
+                    color = "#39ff14" if (x, y) in self.found_sar else "#6b8e6b"
+                elif tile_val == 4:
+                    color = "#ff6700" if (x, y) in self.found_cp else "#a3704c"
+
+                self.canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    fill=color,
+                    outline="#e5e7eb" if self.tile_size < 15 else "gray"
+                )
+
+                if show_numbers and self.visit_counts[y][x] > 0 and tile_val not in (1, 3):
                     center_x = x1 + (self.tile_size / 2)
                     center_y = y1 + (self.tile_size / 2)
-                    self.canvas.create_text(center_x, center_y, text=str(self.visit_counts[y][x]), fill="black", font=("Arial", max(7, self.tile_size // 3), "bold"))
-                
-                if (x, y) == self.drone_pos:
-                    pad = max(2, self.tile_size // 8)
-                    self.canvas.create_oval(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill="blue")
+                    self.canvas.create_text(
+                        center_x, center_y,
+                        text=str(self.visit_counts[y][x]),
+                        fill="black",
+                        font=("Arial", max(7, self.tile_size // 3), "bold")
+                    )
 
-                if hasattr(self, 'mcts_plan') and self.mcts_plan:
-                    line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
-                                self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
-                    for i in range(0, len(self.mcts_plan) - 1, 2):
-                        px, py = self.mcts_plan[i], self.mcts_plan[i+1]
-                        line_points.extend([px * self.tile_size + (self.tile_size / 2), py * self.tile_size + (self.tile_size / 2)])
-                        x1, y1 = px * self.tile_size, py * self.tile_size
-                        x2, y2 = x1 + self.tile_size, y1 + self.tile_size
-                        pad = max(2, self.tile_size // 4)
-                        self.canvas.create_rectangle(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill="red", tags="plan")
-                    if len(line_points) >= 4:
-                        self.canvas.create_line(line_points, fill="red", width=2, tags="plan")
+        # LAYER 1 (Bottom): Draw all 8 Sparse Candidate Paths if "All Paths (8)" is checked
+        if self.show_all_paths.get():
+            for drone_id, paths_list in self.sparse_plans.items():
+                if not paths_list or drone_id >= len(self.drone_positions):
+                    continue
+                light_col = self.DRONE_LIGHT_COLORS[drone_id % len(self.DRONE_LIGHT_COLORS)]
+                dark_col = self.DRONE_COLORS[drone_id % len(self.DRONE_COLORS)]
+                dx, dy = self.drone_positions[drone_id]
+                start_cx = dx * self.tile_size + (self.tile_size / 2)
+                start_cy = dy * self.tile_size + (self.tile_size / 2)
 
-                if hasattr(self, 'astar_plan') and self.astar_plan:
-                    # 1. Anchor the start of the line exactly to the drone's center
-                    line_points = [self.drone_pos[0] * self.tile_size + (self.tile_size / 2),
-                                self.drone_pos[1] * self.tile_size + (self.tile_size / 2)]
-                    
-                    # 2. Add all the remaining A* escape coordinates
-                    for i in range(0, len(self.astar_plan), 2):
-                        px, py = self.astar_plan[i], self.astar_plan[i+1]
-                        line_points.extend([px * self.tile_size + (self.tile_size / 2), py * self.tile_size + (self.tile_size / 2)])
-                        
-                    if len(line_points) >= 4:
-                        # 3. Draw it as a thick brown dotted line
-                        self.canvas.create_line(line_points, fill="#8B4513", width=3, dash=(2, 4), tags="astar_plan")
+                for cand_coords in paths_list:
+                    if len(cand_coords) < 2:
+                        continue
+                    pts = [start_cx, start_cy]
+                    for i in range(0, len(cand_coords) - 1, 2):
+                        px, py = cand_coords[i], cand_coords[i + 1]
+                        pts.extend([
+                            px * self.tile_size + (self.tile_size / 2),
+                            py * self.tile_size + (self.tile_size / 2)
+                        ])
+                    if len(pts) >= 4:
+                        self.canvas.create_line(pts, fill=dark_col, width=1, dash=(2, 3), tags="sparse_plan")
+                        end_x, end_y = pts[-2], pts[-1]
+                        r = max(2, self.tile_size // 7)
+                        self.canvas.create_oval(
+                            end_x - r, end_y - r, end_x + r, end_y + r,
+                            fill=light_col, outline=dark_col, tags="sparse_plan"
+                        )
 
-    def toggle_obstacle(self, event):
-        if self.running: return 
+        # LAYER 2 (Middle): Draw Full 10-Step Winning Rollout if "Best Path (10)" is checked
+        if self.show_best_path.get():
+            for drone_id, full_plan in self.best_full_plans.items():
+                if not full_plan or drone_id >= len(self.drone_positions):
+                    continue
+                d_color = self.DRONE_COLORS[drone_id % len(self.DRONE_COLORS)]
+                dx, dy = self.drone_positions[drone_id]
+                line_points = [
+                    dx * self.tile_size + (self.tile_size / 2),
+                    dy * self.tile_size + (self.tile_size / 2)
+                ]
+                for i in range(0, len(full_plan) - 1, 2):
+                    px, py = full_plan[i], full_plan[i + 1]
+                    cx = px * self.tile_size + (self.tile_size / 2)
+                    cy = py * self.tile_size + (self.tile_size / 2)
+                    line_points.extend([cx, cy])
+                    r = max(2, self.tile_size // 6)
+                    self.canvas.create_oval(
+                        cx - r, cy - r, cx + r, cy + r,
+                        outline=d_color, width=1, tags="best_full_plan"
+                    )
+                if len(line_points) >= 4:
+                    self.canvas.create_line(
+                        line_points, fill=d_color, width=2, dash=(5, 2), tags="best_full_plan"
+                    )
+
+        # LAYER 3 (Top): Draw each drone's active 3-step committed chain
+        for drone_id, plan in self.mcts_plans.items():
+            if not plan or drone_id >= len(self.drone_positions):
+                continue
+            d_color = self.DRONE_COLORS[drone_id % len(self.DRONE_COLORS)]
+            dx, dy = self.drone_positions[drone_id]
+            line_points = [
+                dx * self.tile_size + (self.tile_size / 2),
+                dy * self.tile_size + (self.tile_size / 2)
+            ]
+            for i in range(0, len(plan) - 1, 2):
+                px, py = plan[i], plan[i + 1]
+                line_points.extend([
+                    px * self.tile_size + (self.tile_size / 2),
+                    py * self.tile_size + (self.tile_size / 2)
+                ])
+                x1, y1 = px * self.tile_size, py * self.tile_size
+                x2, y2 = x1 + self.tile_size, y1 + self.tile_size
+                pad = max(2, self.tile_size // 4)
+                self.canvas.create_rectangle(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill="red", outline=d_color, tags="plan")
+            if len(line_points) >= 4:
+                self.canvas.create_line(line_points, fill="red", width=2, tags="plan")
+
+        # Draw each drone's A* RTL path
+        for drone_id, astar_plan in self.astar_plans.items():
+            if not astar_plan or drone_id >= len(self.drone_positions):
+                continue
+            d_color = self.DRONE_COLORS[drone_id % len(self.DRONE_COLORS)]
+            dx, dy = self.drone_positions[drone_id]
+            line_points = [
+                dx * self.tile_size + (self.tile_size / 2),
+                dy * self.tile_size + (self.tile_size / 2)
+            ]
+            for i in range(0, len(astar_plan) - 1, 2):
+                px, py = astar_plan[i], astar_plan[i + 1]
+                line_points.extend([
+                    px * self.tile_size + (self.tile_size / 2),
+                    py * self.tile_size + (self.tile_size / 2)
+                ])
+            if len(line_points) >= 4:
+                self.canvas.create_line(line_points, fill=d_color, width=3, dash=(2, 4), tags="astar_plan")
+
+        # Draw UAVs
+        for idx, (dx, dy) in enumerate(self.drone_positions):
+            x1, y1 = dx * self.tile_size, dy * self.tile_size
+            x2, y2 = x1 + self.tile_size, y1 + self.tile_size
+            pad = max(2, self.tile_size // 8)
+            d_color = self.DRONE_COLORS[idx % len(self.DRONE_COLORS)]
+            self.canvas.create_oval(x1 + pad, y1 + pad, x2 - pad, y2 - pad, fill=d_color, outline="white", width=1)
+            if self.tile_size >= 14:
+                self.canvas.create_text(
+                    x1 + self.tile_size / 2,
+                    y1 + self.tile_size / 2,
+                    text=str(idx),
+                    fill="white",
+                    font=("Arial", max(7, self.tile_size // 3), "bold")
+                )
+
+    def on_canvas_click(self, event):
+        if self.running:
+            return
         x = event.x // self.tile_size
         y = event.y // self.tile_size
-        if (x, y) != self.drone_pos and 0 <= x < self.width and 0 <= y < self.height:
-            self.grid[y][x] = 1 if self.grid[y][x] == 0 else 0
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return
+
+        if self.uav_mode.get():
+            if (x, y) in self.drone_positions:
+                if len(self.drone_positions) > 1:
+                    self.drone_positions.remove((x, y))
+            else:
+                if self.grid[y][x] in (1, 3):
+                    self.grid[y][x] = 0
+                self.drone_positions.append((x, y))
+            self.launch_positions = list(self.drone_positions)
+            self.draw_grid()
+            return
+
+        if (x, y) not in self.drone_positions:
+            curr = self.grid[y][x]
+            if curr == 0:
+                self.grid[y][x] = 1
+            elif curr == 1 and self.sar_enabled.get():
+                self.grid[y][x] = 3
+            elif curr in (1, 3) and self.cp_enabled.get():
+                self.grid[y][x] = 4
+            else:
+                self.grid[y][x] = 0
             self.draw_grid()
 
     def start_simulation(self):
+        if not self.drone_positions:
+            self.drone_positions = [(0, 0)]
+        if not self.running and hasattr(self, 'launch_positions') and len(self.launch_positions) == len(self.drone_positions):
+            self.drone_positions = list(self.launch_positions)
+        else:
+            self.launch_positions = list(self.drone_positions)
+
+        self.visit_counts = [[0 for _ in range(self.width)] for _ in range(self.height)]
+        self.explored = [[False for _ in range(self.width)] for _ in range(self.height)]
+        self.camera_explored = [[False for _ in range(self.width)] for _ in range(self.height)]
+        self.frontiers = set()
+        self.found_sar = set()
+        self.found_cp = set()
+        self.mcts_plans = {}
+        self.best_full_plans = {}
+        self.sparse_plans = {}
+        self.astar_plans = {}
+
+        for dx, dy in self.drone_positions:
+            if self.grid[dy][dx] in (1, 3):
+                self.grid[dy][dx] = 0
+
+        has_sar_on_grid = any(self.grid[y][x] == 3 for y in range(self.height) for x in range(self.width))
+        if self.sar_enabled.get() and not has_sar_on_grid:
+            try:
+                self.place_random_objects(3, int(self.sar_qty_input.get()))
+            except ValueError:
+                pass
+
+        has_cp_on_grid = any(self.grid[y][x] == 4 for y in range(self.height) for x in range(self.width))
+        if self.cp_enabled.get() and not has_cp_on_grid:
+            try:
+                self.place_random_objects(4, int(self.cp_qty_input.get()))
+            except ValueError:
+                pass
+
+        self.draw_grid()
+
         self.running = True
         self.start_btn.config(state=tk.DISABLED)
         self.apply_btn.config(state=tk.DISABLED)
         self.gen_btn.config(state=tk.DISABLED)
-        
+
         self.root.after(20, self.process_queue)
         threading.Thread(target=self.run_cpp_brain, daemon=True).start()
+
+    def is_opaque(self, x, y):
+        return self.grid[y][x] in (1, 3)
 
     def has_line_of_sight(self, x0, y0, x1, y1):
         dx = abs(x1 - x0)
@@ -249,8 +555,10 @@ class DroneVisualizer:
         err = dx - dy
 
         while True:
-            if x0 == x1 and y0 == y1: return True
-            if self.grid[y0][x0] == 1: return False
+            if x0 == x1 and y0 == y1:
+                return True
+            if self.is_opaque(x0, y0):
+                return False
             e2 = 2 * err
             prev_x, prev_y = x0, y0
             if e2 > -dy:
@@ -259,52 +567,88 @@ class DroneVisualizer:
             if e2 < dx:
                 err += dx
                 y0 += sy
-            if x0 != prev_x or y0 != prev_y:
-                if self.grid[prev_y][x0] == 1 or self.grid[y0][prev_x] == 1: return False
+            if x0 != prev_x and y0 != prev_y:
+                if self.is_opaque(x0, prev_y) or self.is_opaque(prev_x, y0):
+                    return False
+
+    def observe_from_position(self, new_x, new_y):
+        radius = self.fov_slider.get()
+        radius_squared = radius ** 2
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if (dx ** 2 + dy ** 2) > radius_squared:
+                    continue
+                ex, ey = new_x + dx, new_y + dy
+                if 0 <= ex < self.width and 0 <= ey < self.height:
+                    if not self.is_opaque(ex, ey) and self.has_line_of_sight(new_x, new_y, ex, ey):
+                        self.explored[ey][ex] = True
+
+        camera_radius = self.camera_fov_slider.get()
+        camera_radius_squared = camera_radius ** 2
+        for dy in range(-camera_radius, camera_radius + 1):
+            for dx in range(-camera_radius, camera_radius + 1):
+                if (dx ** 2 + dy ** 2) > camera_radius_squared:
+                    continue
+                ex, ey = new_x + dx, new_y + dy
+                if 0 <= ex < self.width and 0 <= ey < self.height:
+                    if self.has_line_of_sight(new_x, new_y, ex, ey):
+                        if not self.is_opaque(ex, ey):
+                            self.camera_explored[ey][ex] = True
+                        if self.grid[ey][ex] == 3:
+                            self.found_sar.add((ex, ey))
+                        elif self.grid[ey][ex] == 4:
+                            self.found_cp.add((ex, ey))
 
     def process_queue(self):
         try:
             while True:
                 msg_type, data = self.ui_queue.get_nowait()
-                
+
                 if msg_type == "FRONTIERS":
                     self.frontiers = data
-                    self.draw_grid()
+                elif msg_type == "FOUND_SAR":
+                    self.found_sar.add(data)
+                elif msg_type == "FOUND_CP":
+                    self.found_cp.add(data)
                 elif msg_type == "TSDF":
-                    # Reshape the flat 1D list back into a 2D grid matrix
                     self.tsdf_grid = [data[i * self.width:(i + 1) * self.width] for i in range(self.height)]
-                    self.draw_grid()
                 elif msg_type == "ASTAR":
-                    self.astar_plan = data
-                    #self.mcts_plan = [] 
-                    self.draw_grid()    
+                    drone_id, coords = data
+                    self.astar_plans[drone_id] = coords
+                    self.mcts_plans[drone_id] = []
+                    self.best_full_plans[drone_id] = []
+                    self.sparse_plans[drone_id] = []
                 elif msg_type == "PATH":
-                    self.mcts_plan = data
-                    #self.astar_plan = [] 
-                    self.draw_grid()
-                        
-                elif msg_type == "MOVE":
-                    new_x, new_y = data
-                    self.drone_pos = (new_x, new_y)
-                    self.visit_counts[new_y][new_x] += 1
+                    drone_id, coords = data
+                    self.mcts_plans[drone_id] = coords
+                    self.astar_plans[drone_id] = []
+                elif msg_type == "BEST_PATH":
+                    drone_id, coords = data
+                    self.best_full_plans[drone_id] = coords
+                elif msg_type == "SPARSE_PATHS":
+                    drone_id, paths_list = data
+                    self.sparse_plans[drone_id] = paths_list
 
-                    radius = self.fov_slider.get()
-                    radius_squared = radius ** 2
-                    for dy in range(-radius, radius + 1):
-                        for dx in range(-radius, radius + 1):
-                            if (dx**2 + dy**2) > radius_squared: continue
-                            ex, ey = new_x + dx, new_y + dy
-                            if 0 <= ex < self.width and 0 <= ey < self.height:
-                                if self.has_line_of_sight(new_x, new_y, ex, ey):
-                                    self.explored[ey][ex] = True
+                elif msg_type == "MOVE":
+                    drone_id, new_x, new_y = data
+                    if 0 <= drone_id < len(self.drone_positions):
+                        self.drone_positions[drone_id] = (new_x, new_y)
+                    self.visit_counts[new_y][new_x] += 1
+                    self.observe_from_position(new_x, new_y)
+
+                    # Trim the first step from best_full_plans if it matches the step just taken
+                    if drone_id in self.best_full_plans and len(self.best_full_plans[drone_id]) >= 2:
+                        if self.best_full_plans[drone_id][0] == new_x and self.best_full_plans[drone_id][1] == new_y:
+                            self.best_full_plans[drone_id] = self.best_full_plans[drone_id][2:]
+
                     self.draw_grid()
-                    
-                    # DECOUPLING MAGIC: Stop processing the queue and wait based on the slider value!
+
                     if self.running:
                         self.root.after(self.speed_slider.get(), self.process_queue)
-                    return # Exit the function so the UI can sleep
-                    
+                    return
+
                 elif msg_type == "HALT":
+                    self.draw_grid()
                     print(f"\n>>> SIMULATION HALTED: {data} <<<\n")
                     self.start_btn.config(state=tk.NORMAL)
                     self.apply_btn.config(state=tk.NORMAL)
@@ -316,55 +660,99 @@ class DroneVisualizer:
 
         except queue.Empty:
             pass
-            
-        # If the queue was empty (C++ is thinking), check again in 10ms
+
         if self.running:
             self.root.after(10, self.process_queue)
 
     def run_cpp_brain(self):
         process = subprocess.Popen(['./drone'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        setup_data = f"{self.width} {self.height} {self.drone_pos[0]} {self.drone_pos[1]} {self.fov_slider.get()}\n"
+
+        sar_en = 1 if self.sar_enabled.get() else 0
+        sar_rtl_flag = 1 if self.sar_rtl.get() else 0
+        cp_en = 1 if self.cp_enabled.get() else 0
+        cp_coords_flag = 1 if self.cp_coords.get() else 0
+        cp_rtl_flag = 1 if self.cp_rtl.get() else 0
+
+        num_drones = len(self.drone_positions)
+        setup_data = (
+            f"{self.width} {self.height} {num_drones} "
+            f"{self.fov_slider.get()} {self.camera_fov_slider.get()} "
+            f"{sar_en} {sar_rtl_flag} {cp_en} {cp_coords_flag} {cp_rtl_flag}\n"
+        )
+        for dx, dy in self.drone_positions:
+            setup_data += f"{dx} {dy}\n"
         for row in self.grid:
             setup_data += " ".join(map(str, row)) + "\n"
+
         process.stdin.write(setup_data)
         process.stdin.flush()
-        
+
         for line in process.stdout:
             line = line.strip()
+            if not line:
+                continue
 
             if line.startswith("FRONTIERS"):
                 coords = list(map(int, line.split()[1:]))
                 frontier_set = set()
-                for i in range(0, len(coords), 2):
-                    frontier_set.add((coords[i], coords[i+1]))
+                for i in range(0, len(coords) - 1, 2):
+                    frontier_set.add((coords[i], coords[i + 1]))
                 self.ui_queue.put(("FRONTIERS", frontier_set))
                 continue
+            if line.startswith("FOUND_SAR"):
+                parts = line.split()
+                if len(parts) >= 3:
+                    self.ui_queue.put(("FOUND_SAR", (int(parts[1]), int(parts[2]))))
+                continue
+            if line.startswith("FOUND_CP"):
+                parts = line.split()
+                if len(parts) >= 3:
+                    self.ui_queue.put(("FOUND_CP", (int(parts[1]), int(parts[2]))))
+                continue
             if line.startswith("ASTAR_PATH"):
-                coords = list(map(int, line.split()[1:]))
-                self.ui_queue.put(("ASTAR", coords))
+                parts = list(map(int, line.split()[1:]))
+                if len(parts) >= 1:
+                    self.ui_queue.put(("ASTAR", (parts[0], parts[1:])))
+                continue
+            if line.startswith("BEST_PATH"):
+                parts = list(map(int, line.split()[1:]))
+                if len(parts) >= 1:
+                    self.ui_queue.put(("BEST_PATH", (parts[0], parts[1:])))
+                continue
+            if line.startswith("SPARSE_PATHS"):
+                tokens = line.split()[1:]
+                if len(tokens) >= 1:
+                    drone_id = int(tokens[0])
+                    raw_str = " ".join(tokens[1:])
+                    path_chunks = [chunk.strip() for chunk in raw_str.split("|") if chunk.strip()]
+                    parsed_paths = []
+                    for ch in path_chunks:
+                        parsed_paths.append(list(map(int, ch.split())))
+                    self.ui_queue.put(("SPARSE_PATHS", (drone_id, parsed_paths)))
                 continue
             if line.startswith("PATH"):
-                coords = list(map(int, line.split()[1:]))
-                self.ui_queue.put(("PATH", coords))
+                parts = list(map(int, line.split()[1:]))
+                if len(parts) >= 1:
+                    self.ui_queue.put(("PATH", (parts[0], parts[1:])))
                 continue
             if line.startswith("TSDF"):
                 coords = list(map(float, line.split()[1:]))
                 self.ui_queue.put(("TSDF", coords))
                 continue
+            if line.startswith("MOVE"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    self.ui_queue.put(("MOVE", (int(parts[1]), int(parts[2]), int(parts[3]))))
+                continue
             if line == "DONE" or line == "STUCK":
                 self.ui_queue.put(("HALT", line))
                 break
-                
-            parts = line.split()
-            if len(parts) == 2 and parts[0].lstrip('-').isdigit() and parts[1].lstrip('-').isdigit():
-                new_x, new_y = int(parts[0]), int(parts[1])
-                self.ui_queue.put(("MOVE", (new_x, new_y)))
-                # REMOVED: time.sleep(0.04) -> C++ now runs at maximum speed!
-            else:
-                if not line.startswith("PATH") and not line.startswith("ASTAR_PATH") and not line.startswith("FRONTIERS"):
-                    self.ui_queue.put(("PRINT", line))
+
+            self.ui_queue.put(("PRINT", line))
+
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = DroneVisualizer(root)
     root.mainloop()
+    
