@@ -189,9 +189,9 @@ public:
         }
 
         double lateral_ridge = std::min(safe_clearance + 0.5, std::max({t_left_curr, t_right_curr, t_left_next, t_right_next}));
-        double deadband_threshold = std::min(0.0, lateral_ridge - 0.2);
-        if (next_t < lateral_ridge) {
-            double off_center = lateral_ridge - next_t;
+        double deadband_threshold = std::max(0.0, lateral_ridge - 0.20);
+        if (next_t < deadband_threshold) {
+            double off_center = deadband_threshold - next_t;
             return weight * off_center * off_center;
         }
         return 0.0;
@@ -2186,7 +2186,8 @@ struct RunStats {
     int turns_0_deg = 0;
     int turns_45_deg = 0;
     int turns_90_deg = 0;
-    int turns_gt90_deg = 0;
+    int turns_135_deg = 0;
+    int turns_180_deg = 0;
     double total_swarm_distance = 0.0;
     double tsdf_sum = 0.0;
     double min_tsdf = std::numeric_limits<double>::infinity();
@@ -2194,9 +2195,66 @@ struct RunStats {
     double total_planning_ms = 0.0;
     int planning_calls = 0;
     int exploration_steps = -1;
+    bool exploration_snapshot_taken = false;
+    std::vector<std::vector<int>> exploration_visits;
+    std::vector<std::vector<int>> exploration_own_visits;
+    int unique_visited_tiles = 0;
+    int total_tile_visits = 0;
+    std::vector<std::vector<uint8_t>> prev_lidar_fov;
+    std::vector<std::vector<uint8_t>> prev_cam_fov;
+    std::vector<uint8_t> ever_lidar_seen;
+    std::vector<uint8_t> ever_cam_seen;
+    int real_lidar_overlap = 0;
+    int real_camera_overlap = 0;
     std::vector<int> sar_discovery_steps;
     std::vector<int> cp_discovery_steps;
 };
+
+void recordRealOverlapForDrone(int drone_id, Position pos, const Environment& known_map,
+                               const std::vector<std::vector<int>>& true_map, RunStats& stats) {
+    int width = known_map.getWidth();
+    int height = known_map.getHeight();
+    std::vector<uint8_t> curr_lidar(width * height, 0);
+    std::vector<uint8_t> curr_cam(width * height, 0);
+    int lidar_radius = known_map.getLidarFovRadius();
+    int camera_radius = known_map.getCameraFovRadius();
+
+    for (int dy = -lidar_radius; dy <= lidar_radius; ++dy) {
+        for (int dx = -lidar_radius; dx <= lidar_radius; ++dx) {
+            if (dx * dx + dy * dy > lidar_radius * lidar_radius) continue;
+            int x = pos.x + dx, y = pos.y + dy;
+            if (x < 0 || x >= width || y < 0 || y >= height) continue;
+            if (Environment::isOpaqueTile(true_map[y][x])) continue;
+            if (known_map.hasLineOfSight(pos.x, pos.y, x, y, true_map)) {
+                curr_lidar[y * width + x] = 1;
+            }
+        }
+    }
+    for (int dy = -camera_radius; dy <= camera_radius; ++dy) {
+        for (int dx = -camera_radius; dx <= camera_radius; ++dx) {
+            if (dx * dx + dy * dy > camera_radius * camera_radius) continue;
+            int x = pos.x + dx, y = pos.y + dy;
+            if (x < 0 || x >= width || y < 0 || y >= height) continue;
+            if (Environment::isOpaqueTile(known_map.grid[y][x])) continue;
+            if (known_map.hasCameraLineOfSight(pos.x, pos.y, x, y)) {
+                curr_cam[y * width + x] = 1;
+            }
+        }
+    }
+
+    for (int idx = 0; idx < width * height; ++idx) {
+        if (curr_lidar[idx] && !stats.prev_lidar_fov[drone_id][idx]) {
+            if (stats.ever_lidar_seen[idx]) ++stats.real_lidar_overlap;
+            stats.ever_lidar_seen[idx] = 1;
+        }
+        if (curr_cam[idx] && !stats.prev_cam_fov[drone_id][idx]) {
+            if (stats.ever_cam_seen[idx]) ++stats.real_camera_overlap;
+            stats.ever_cam_seen[idx] = 1;
+        }
+    }
+    stats.prev_lidar_fov[drone_id] = std::move(curr_lidar);
+    stats.prev_cam_fov[drone_id] = std::move(curr_cam);
+}
 
 int countReachableFreeTiles(const Environment& true_map, const std::vector<DroneAgent>& agents) {
     const int width = true_map.getWidth();
@@ -2253,54 +2311,76 @@ int countCameraCoveredTiles(const Environment& map) {
     return count;
 }
 
+int countLidarCoveredTiles(const Environment& map) {
+    int count = 0;
+    for (const auto& row : map.grid) {
+        for (int value : row) count += (value == 0 || value == 2) ? 1 : 0;
+    }
+    return count;
+}
+
 void emitStats(const std::string& status, int total_steps, const Environment& known_map,
                const std::vector<DroneAgent>& agents, const TSDFMap&, const RunStats& stats) {
     int camera_covered_tiles = countCameraCoveredTiles(known_map);
-    int redundant_camera_obs = 0;
+    int lidar_covered_tiles = countLidarCoveredTiles(known_map);
+    const auto& visit_grid = stats.exploration_snapshot_taken ? stats.exploration_visits : known_map.visits;
     int unique_visited_tiles = 0;
     int total_tile_visits = 0;
     int own_revisit_steps = 0;
     int inter_drone_overlap_tiles = 0;
     for (int y = 0; y < known_map.getHeight(); ++y) {
         for (int x = 0; x < known_map.getWidth(); ++x) {
-            if (known_map.camera_observations[y][x] > 1) {
-                redundant_camera_obs += known_map.camera_observations[y][x] - 1;
-            }
-            if (known_map.visits[y][x] > 0) ++unique_visited_tiles;
-            total_tile_visits += known_map.visits[y][x];
+            if (visit_grid[y][x] > 0) ++unique_visited_tiles;
+            total_tile_visits += visit_grid[y][x];
             int distinct_visitors = 0;
             int index = y * known_map.getWidth() + x;
-            for (const auto& agent : agents) {
-                if (agent.flat_own_visits[index] > 0) ++distinct_visitors;
-                own_revisit_steps += std::max(0, agent.flat_own_visits[index] - 1);
+            for (size_t agent_index = 0; agent_index < agents.size(); ++agent_index) {
+                const auto& own_visits = stats.exploration_snapshot_taken
+                    ? stats.exploration_own_visits[agent_index]
+                    : agents[agent_index].flat_own_visits;
+                if (own_visits[index] > 0) ++distinct_visitors;
+                own_revisit_steps += std::max(0, own_visits[index] - 1);
             }
             if (distinct_visitors >= 2) ++inter_drone_overlap_tiles;
         }
     }
-    auto firstOrMinusOne = [](const std::vector<int>& values, bool all_found, int total) {
+    auto firstOrMinusOne = [](const std::vector<int>& values, bool all_found) {
         if (values.empty()) return -1;
         return all_found ? values.back() : values.front();
     };
     bool sar_all = stats.sar_discovery_steps.size() >= static_cast<size_t>(known_map.total_sar_objects);
     bool cp_all = stats.cp_discovery_steps.size() >= static_cast<size_t>(known_map.total_cp_objects);
     double avg_tsdf = stats.total_moves > 0 ? stats.tsdf_sum / stats.total_moves : 0.0;
-    double coverage_pct = 100.0 * camera_covered_tiles / std::max(1, stats.total_reachable_free_tiles);
-    double overlap_ratio = static_cast<double>(redundant_camera_obs) / std::max(1, camera_covered_tiles);
+    double lidar_coverage_pct = 100.0 * lidar_covered_tiles / std::max(1, stats.total_reachable_free_tiles);
+    double camera_coverage_pct = 100.0 * camera_covered_tiles / std::max(1, stats.total_reachable_free_tiles);
+    double lidar_overlap_ratio = static_cast<double>(stats.real_lidar_overlap) / std::max(1, lidar_covered_tiles);
+    double camera_overlap_ratio = static_cast<double>(stats.real_camera_overlap) / std::max(1, camera_covered_tiles);
     double avg_planning_ms = stats.planning_calls > 0 ? stats.total_planning_ms / stats.planning_calls : 0.0;
     int first_sar = stats.sar_discovery_steps.empty() ? -1 : stats.sar_discovery_steps.front();
-    int all_sar = firstOrMinusOne(stats.sar_discovery_steps, sar_all, known_map.total_sar_objects);
+    int all_sar = firstOrMinusOne(stats.sar_discovery_steps, sar_all);
     int first_cp = stats.cp_discovery_steps.empty() ? -1 : stats.cp_discovery_steps.front();
-    int all_cp = firstOrMinusOne(stats.cp_discovery_steps, cp_all, known_map.total_cp_objects);
+    int all_cp = firstOrMinusOne(stats.cp_discovery_steps, cp_all);
+
+    std::cout << "HEATMAP";
+    for (const auto& row : visit_grid) {
+        for (int value : row) std::cout << " " << value;
+    }
+    std::cout << "\n";
 
     std::cout << std::setprecision(10)
               << "STATS {\"status\":\"" << status
               << "\",\"total_steps\":" << total_steps
               << ",\"exploration_steps\":" << stats.exploration_steps
               << ",\"total_reachable_tiles\":" << stats.total_reachable_free_tiles
+              << ",\"lidar_covered_tiles\":" << lidar_covered_tiles
+              << ",\"lidar_coverage_pct\":" << lidar_coverage_pct
               << ",\"camera_covered_tiles\":" << camera_covered_tiles
-              << ",\"coverage_pct\":" << coverage_pct
-              << ",\"redundant_camera_obs\":" << redundant_camera_obs
-              << ",\"camera_overlap_ratio\":" << overlap_ratio
+              << ",\"camera_coverage_pct\":" << camera_coverage_pct
+              << ",\"coverage_pct\":" << camera_coverage_pct
+              << ",\"real_lidar_overlap\":" << stats.real_lidar_overlap
+              << ",\"lidar_overlap_ratio\":" << lidar_overlap_ratio
+              << ",\"real_camera_overlap\":" << stats.real_camera_overlap
+              << ",\"camera_overlap_ratio\":" << camera_overlap_ratio
               << ",\"unique_visited_tiles\":" << unique_visited_tiles
               << ",\"total_tile_visits\":" << total_tile_visits
               << ",\"revisited_steps\":" << total_tile_visits - unique_visited_tiles
@@ -2311,7 +2391,8 @@ void emitStats(const std::string& status, int total_steps, const Environment& kn
               << ",\"turns_0_deg\":" << stats.turns_0_deg
               << ",\"turns_45_deg\":" << stats.turns_45_deg
               << ",\"turns_90_deg\":" << stats.turns_90_deg
-              << ",\"turns_gt90_deg\":" << stats.turns_gt90_deg
+              << ",\"turns_135_deg\":" << stats.turns_135_deg
+              << ",\"turns_180_deg\":" << stats.turns_180_deg
               << ",\"avg_tsdf_clearance\":" << avg_tsdf
               << ",\"min_tsdf_clearance\":" << (std::isfinite(stats.min_tsdf) ? stats.min_tsdf : 0.0)
               << ",\"tsdf_exposure_pct\":" << (100.0 * stats.tsdf_violation_steps / std::max(1, stats.total_moves))
@@ -2375,6 +2456,11 @@ int main() {
 
     RunStats run_stats;
     run_stats.total_reachable_free_tiles = countReachableFreeTiles(true_map, agents);
+    int total_cells = width * height;
+    run_stats.prev_lidar_fov.assign(num_drones, std::vector<uint8_t>(total_cells, 0));
+    run_stats.prev_cam_fov.assign(num_drones, std::vector<uint8_t>(total_cells, 0));
+    run_stats.ever_lidar_seen.assign(total_cells, 0);
+    run_stats.ever_cam_seen.assign(total_cells, 0);
 
     std::cout << "MAP LOADED. STARTING OPTIMIZED DEC-MCTS LOOP WITH " << num_drones << " DRONES...\n" << std::flush;
 
@@ -2382,7 +2468,11 @@ int main() {
         std::vector<Position> init_walls = known_map.updateLidarFOV(ag.drone_pos.x, ag.drone_pos.y, true_map.grid);
         tsdf.updateTSDF(init_walls);
         known_map.observePhysicalCameraFOV(ag.drone_pos.x, ag.drone_pos.y, true_map.grid);
-        known_map.visits[ag.drone_pos.y][ag.drone_pos.x] += 1;
+        recordRealOverlapForDrone(ag.id, ag.drone_pos, known_map, true_map.grid, run_stats);
+        int& initial_visits = known_map.visits[ag.drone_pos.y][ag.drone_pos.x];
+        if (initial_visits == 0) ++run_stats.unique_visited_tiles;
+        ++initial_visits;
+        ++run_stats.total_tile_visits;
         std::cout << "MOVE " << ag.id << " " << ag.drone_pos.x << " " << ag.drone_pos.y << "\n" << std::flush;
     }
     known_map.invalidateAllCellCaches();
@@ -2402,7 +2492,15 @@ int main() {
 
         if (!global_rtl_active && known_map.shouldTriggerRTL(current_positions, tsdf)) {
             global_rtl_active = true;
-            if (run_stats.exploration_steps < 0) run_stats.exploration_steps = game_step + 1;
+            if (run_stats.exploration_steps < 0) {
+                run_stats.exploration_steps = game_step;
+                run_stats.exploration_visits = known_map.visits;
+                run_stats.exploration_own_visits.clear();
+                for (const auto& agent : agents) {
+                    run_stats.exploration_own_visits.push_back(agent.flat_own_visits);
+                }
+                run_stats.exploration_snapshot_taken = true;
+            }
             std::cout << "FRONTIERS \n" << std::flush;
             std::cout << "MISSION COMPLETE. ALL UAVS RETURNING TO LAUNCH.\n" << std::flush;
 
@@ -2651,6 +2749,8 @@ int main() {
                 }
             }
 
+            Position old_pos = ag.drone_pos;
+            Position old_prev_pos = ag.prev_pos;
             reserved_next_tiles.insert(chosen_next);
             reserved_transitions.push_back({ag.drone_pos, chosen_next});
 
@@ -2677,33 +2777,37 @@ int main() {
                 ag.mcts_root = ag.mcts_root->extractChild(ag.drone_pos);
             }
 
-            if (!is_hover) {
-                int old_x = ag.drone_pos.x;
-                int old_y = ag.drone_pos.y;
-                double move_length = (chosen_next.x != old_x && chosen_next.y != old_y) ? 1.41421356 : 1.0;
+            if (!global_rtl_active) {
+                if (!is_hover) {
+                double move_length = (chosen_next.x != old_pos.x && chosen_next.y != old_pos.y) ? 1.41421356 : 1.0;
                 ++run_stats.total_moves;
                 run_stats.total_swarm_distance += move_length;
                 double clearance = tsdf.getTSDFValue(chosen_next.x, chosen_next.y);
                 run_stats.tsdf_sum += clearance;
                 run_stats.min_tsdf = std::min(run_stats.min_tsdf, clearance);
                 if (clearance < safe_clearance) ++run_stats.tsdf_violation_steps;
-                if (ag.prev_pos.x != -1) {
-                    int in_dx = old_x - ag.prev_pos.x;
-                    int in_dy = old_y - ag.prev_pos.y;
-                    int out_dx = chosen_next.x - old_x;
-                    int out_dy = chosen_next.y - old_y;
+                if (old_prev_pos.x != -1) {
+                    int in_dx = old_pos.x - old_prev_pos.x;
+                    int in_dy = old_pos.y - old_prev_pos.y;
+                    int out_dx = chosen_next.x - old_pos.x;
+                    int out_dy = chosen_next.y - old_pos.y;
                     double in_length = (in_dx != 0 && in_dy != 0) ? 1.41421356 : 1.0;
                     double out_length = (out_dx != 0 && out_dy != 0) ? 1.41421356 : 1.0;
                     double cos_turn = (in_dx * out_dx + in_dy * out_dy) / (in_length * out_length);
                     if (cos_turn > 0.95) ++run_stats.turns_0_deg;
                     else if (cos_turn > 0.50) ++run_stats.turns_45_deg;
                     else if (cos_turn > -0.10) ++run_stats.turns_90_deg;
-                    else ++run_stats.turns_gt90_deg;
+                    else if (cos_turn > -0.80) ++run_stats.turns_135_deg;
+                    else ++run_stats.turns_180_deg;
                 }
-                ag.flat_own_visits[ag.drone_pos.y * width + ag.drone_pos.x] += 1;
-                known_map.visits[ag.drone_pos.y][ag.drone_pos.x] += 1;
-            } else {
-                ++run_stats.total_hovers;
+                ag.flat_own_visits[chosen_next.y * width + chosen_next.x] += 1;
+                int& visits = known_map.visits[chosen_next.y][chosen_next.x];
+                if (visits == 0) ++run_stats.unique_visited_tiles;
+                ++visits;
+                ++run_stats.total_tile_visits;
+                } else {
+                    ++run_stats.total_hovers;
+                }
             }
 
             // If this step just landed on the final tile of a truncated 1-tile corridor path,
@@ -2725,6 +2829,9 @@ int main() {
                 any_new_walls = true;
             }
             known_map.observePhysicalCameraFOV(ag.drone_pos.x, ag.drone_pos.y, true_map.grid);
+            if (!global_rtl_active) {
+                recordRealOverlapForDrone(ag.id, ag.drone_pos, known_map, true_map.grid, run_stats);
+            }
         }
 
         if (any_new_walls) {
@@ -2822,11 +2929,15 @@ int main() {
             std::cout << "MOVE " << ag.id << " " << ag.drone_pos.x << " " << ag.drone_pos.y << "\n" << std::flush;
         }
 
-        std::cout << "METRIC " << game_step + 1 << " "
+                if (!global_rtl_active) {
+                        std::cout << "METRIC " << game_step + 1 << " "
+              << countLidarCoveredTiles(known_map) << " "
               << countCameraCoveredTiles(known_map) << " "
               << run_stats.total_reachable_free_tiles << " "
+              << run_stats.total_tile_visits - run_stats.unique_visited_tiles << " "
               << known_map.discovered_sar.size() << " "
               << known_map.discovered_cp.size() << "\n" << std::flush;
+          }
 
         if (game_step == max_game_steps - 1) {
             emitStats("STUCK", max_game_steps, known_map, agents, tsdf, run_stats);

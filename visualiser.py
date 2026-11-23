@@ -3,6 +3,14 @@ import subprocess
 import threading
 import random
 import queue
+import csv
+import json
+import os
+import statistics
+from datetime import datetime
+from tkinter import filedialog, messagebox
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class DroneVisualizer:
@@ -46,6 +54,12 @@ class DroneVisualizer:
         self.best_full_plans = {}
         self.sparse_plans = {}
         self.astar_plans = {}
+        self.tsdf_grid = []
+        self.current_map_name = "unsaved_map"
+        self.current_run_metrics = []
+        self.last_run_stats = None
+        self.last_run_heatmap = []
+        self.run_id = None
 
         self.ui_queue = queue.Queue()
 
@@ -162,12 +176,111 @@ class DroneVisualizer:
         )
         self.all_paths_cb.grid(row=0, column=14, padx=4)
 
+        benchmark_frame = tk.Frame(root)
+        benchmark_frame.pack(pady=4)
+        self.save_csv = tk.BooleanVar(value=True)
+        tk.Checkbutton(benchmark_frame, text="Save CSV", variable=self.save_csv).grid(row=0, column=0, padx=4)
+        tk.Label(benchmark_frame, text="Algorithm:").grid(row=0, column=1)
+        self.algorithm_input = tk.Entry(benchmark_frame, width=12)
+        self.algorithm_input.insert(0, "Dec-MCTS")
+        self.algorithm_input.grid(row=0, column=2, padx=3)
+        tk.Label(benchmark_frame, text="Trials:").grid(row=0, column=3)
+        self.trials_input = tk.Entry(benchmark_frame, width=5)
+        self.trials_input.insert(0, "10")
+        self.trials_input.grid(row=0, column=4, padx=3)
+        self.save_map_btn = tk.Button(benchmark_frame, text="Save Map", command=self.save_map)
+        self.save_map_btn.grid(row=0, column=5, padx=3)
+        self.load_map_btn = tk.Button(benchmark_frame, text="Load Map", command=self.load_map)
+        self.load_map_btn.grid(row=0, column=6, padx=3)
+        self.reset_map_btn = tk.Button(benchmark_frame, text="Reset Map", command=self.reset_map)
+        self.reset_map_btn.grid(row=0, column=7, padx=3)
+        self.batch_btn = tk.Button(benchmark_frame, text="Run Batch", command=self.run_batch)
+        self.batch_btn.grid(row=0, column=8, padx=3)
+        self.benchmark_status = tk.Label(root, text="Ready")
+        self.benchmark_status.pack()
+
         # --- The Canvas ---
         self.canvas = tk.Canvas(root, bg="white")
         self.canvas.pack(pady=5)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
 
         self.apply_new_size()
+
+    def reset_runtime_state(self):
+        self.visit_counts = [[0 for _ in range(self.width)] for _ in range(self.height)]
+        self.explored = [[False for _ in range(self.width)] for _ in range(self.height)]
+        self.camera_explored = [[False for _ in range(self.width)] for _ in range(self.height)]
+        self.frontiers = set()
+        self.found_sar = set()
+        self.found_cp = set()
+        self.mcts_plans = {}
+        self.best_full_plans = {}
+        self.sparse_plans = {}
+        self.astar_plans = {}
+        self.tsdf_grid = []
+        self.current_run_metrics = []
+        self.last_run_stats = None
+        self.last_run_heatmap = []
+
+    def set_benchmark_controls(self, state):
+        for button in (self.save_map_btn, self.load_map_btn, self.reset_map_btn, self.batch_btn):
+            button.config(state=state)
+
+    def save_map(self):
+        if self.running:
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Maps", "*.json")])
+        if not path:
+            return
+        data = {
+            "name": os.path.splitext(os.path.basename(path))[0],
+            "width": self.width, "height": self.height, "grid": self.grid,
+            "launch_positions": [list(p) for p in self.launch_positions],
+            "fov": self.fov_slider.get(), "camera_fov": self.camera_fov_slider.get(),
+            "sar_enabled": self.sar_enabled.get(), "sar_rtl": self.sar_rtl.get(),
+            "cp_enabled": self.cp_enabled.get(), "cp_coords": self.cp_coords.get(),
+            "cp_rtl": self.cp_rtl.get(),
+        }
+        with open(path, "w", encoding="utf-8") as output:
+            json.dump(data, output, indent=2)
+        self.current_map_name = data["name"]
+
+    def load_map(self):
+        if self.running:
+            return
+        path = filedialog.askopenfilename(filetypes=[("JSON Maps", "*.json")])
+        if not path:
+            return
+        with open(path, encoding="utf-8") as source:
+            data = json.load(source)
+        self.width = int(data["width"])
+        self.height = int(data["height"])
+        self.width_input.delete(0, tk.END)
+        self.width_input.insert(0, str(self.width))
+        self.height_input.delete(0, tk.END)
+        self.height_input.insert(0, str(self.height))
+        self.grid = data["grid"]
+        self.launch_positions = [tuple(p) for p in data["launch_positions"]]
+        self.drone_positions = list(self.launch_positions)
+        self.fov_slider.set(data.get("fov", self.fov_slider.get()))
+        self.camera_fov_slider.set(data.get("camera_fov", self.camera_fov_slider.get()))
+        self.sar_enabled.set(data.get("sar_enabled", False))
+        self.sar_rtl.set(data.get("sar_rtl", True))
+        self.cp_enabled.set(data.get("cp_enabled", False))
+        self.cp_coords.set(data.get("cp_coords", True))
+        self.cp_rtl.set(data.get("cp_rtl", True))
+        self.current_map_name = data.get("name", os.path.splitext(os.path.basename(path))[0])
+        self.calculate_tile_size()
+        self.canvas.config(width=self.width * self.tile_size, height=self.height * self.tile_size)
+        self.reset_runtime_state()
+        self.draw_grid()
+
+    def reset_map(self):
+        if self.running:
+            return
+        self.drone_positions = list(self.launch_positions)
+        self.reset_runtime_state()
+        self.draw_grid()
 
     def calculate_tile_size(self):
         self.tile_size = max(8, min(self.max_canvas_dim // self.width, self.max_canvas_dim // self.height))
@@ -505,16 +618,7 @@ class DroneVisualizer:
         else:
             self.launch_positions = list(self.drone_positions)
 
-        self.visit_counts = [[0 for _ in range(self.width)] for _ in range(self.height)]
-        self.explored = [[False for _ in range(self.width)] for _ in range(self.height)]
-        self.camera_explored = [[False for _ in range(self.width)] for _ in range(self.height)]
-        self.frontiers = set()
-        self.found_sar = set()
-        self.found_cp = set()
-        self.mcts_plans = {}
-        self.best_full_plans = {}
-        self.sparse_plans = {}
-        self.astar_plans = {}
+        self.reset_runtime_state()
 
         for dx, dy in self.drone_positions:
             if self.grid[dy][dx] in (1, 3):
@@ -540,6 +644,8 @@ class DroneVisualizer:
         self.start_btn.config(state=tk.DISABLED)
         self.apply_btn.config(state=tk.DISABLED)
         self.gen_btn.config(state=tk.DISABLED)
+        self.set_benchmark_controls(tk.DISABLED)
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         self.root.after(20, self.process_queue)
         threading.Thread(target=self.run_cpp_brain, daemon=True).start()
@@ -599,6 +705,242 @@ class DroneVisualizer:
                         elif self.grid[ey][ex] == 4:
                             self.found_cp.add((ex, ey))
 
+    def format_stats_summary(self):
+        if not self.last_run_stats:
+            return "No statistics received."
+        stats = self.last_run_stats
+        return (f"Status: {stats.get('status', '?')}\n"
+                f"Coverage: {stats.get('coverage_pct', 0.0):.2f}%\n"
+                f"Steps: {stats.get('total_steps', 0)}\n"
+                f"Distance: {stats.get('total_swarm_distance', 0.0):.2f}\n"
+                f"Planning: {stats.get('avg_planning_ms', 0.0):.2f} ms/call")
+
+    def _csv_append(self, filename, fieldnames, row):
+        filename = os.path.join(BASE_DIR, filename)
+        exists = os.path.exists(filename)
+        if exists:
+            with open(filename, newline="", encoding="utf-8") as source:
+                current_header = next(csv.reader(source), [])
+            if current_header != list(fieldnames):
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                os.replace(filename, f"{os.path.splitext(filename)[0]}_legacy_{stamp}.csv")
+                exists = False
+        with open(filename, "a", newline="", encoding="utf-8") as output:
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            if not exists:
+                writer.writeheader()
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    def save_completed_run(self):
+        if not self.save_csv.get() or not self.last_run_stats:
+            return
+        run_id = self.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "run_id": run_id, "algorithm": self.algorithm_input.get(),
+            "map_name": self.current_map_name, "width": self.width, "height": self.height,
+            "num_drones": len(self.launch_positions), "fov": self.fov_slider.get(),
+            "camera_fov": self.camera_fov_slider.get(), "sar_enabled": int(self.sar_enabled.get()),
+            "cp_enabled": int(self.cp_enabled.get()), "cp_coords": int(self.cp_coords.get()),
+        }
+        summary_fields = list(base) + list(self.last_run_stats)
+        summary_row = dict(base)
+        summary_row.update(self.last_run_stats)
+        self._csv_append("results_summary.csv", summary_fields, summary_row)
+        curve_fields = ["run_id", "algorithm", "map_name", "num_drones", "step",
+                "lidar_covered", "camera_covered", "total_reachable",
+                "lidar_coverage_pct", "camera_coverage_pct", "retaken_steps",
+                "sar_found", "cp_found"]
+        for metric in self.current_run_metrics:
+            row = {"run_id": run_id, "algorithm": self.algorithm_input.get(),
+                   "map_name": self.current_map_name, "num_drones": len(self.launch_positions)}
+            row.update(metric)
+            self._csv_append("results_curves.csv", curve_fields, row)
+        self.export_pgfplots([{"stats": self.last_run_stats,
+                               "metrics": self.current_run_metrics,
+                               "heatmap": self.last_run_heatmap}], run_id)
+
+    def export_pgfplots(self, records, timestamp):
+        if not records: return
+        if records:
+            data_dir = os.path.join(BASE_DIR, "pgfplots_data")
+            os.makedirs(data_dir, exist_ok=True)
+            clean = lambda value: "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(value))
+            prefix = f"{clean(self.current_map_name)}_{clean(self.algorithm_input.get())}_{clean(timestamp)}"
+            curve_path = os.path.join(data_dir, f"pgf_curves_{prefix}.dat")
+            max_step = max((metric.get("step", 0) for record in records for metric in record["metrics"]), default=0)
+            series = []
+            for record in records:
+                by_step = {metric["step"]: metric for metric in record["metrics"]}
+                last = {}
+                values = []
+                for step in range(1, max_step + 1):
+                    if step in by_step:
+                        last = by_step[step]
+                    if last:
+                        values.append((100.0 * last.get("lidar_covered", 0) / max(1, last.get("total_reachable", 1)),
+                                       100.0 * last.get("camera_covered", 0) / max(1, last.get("total_reachable", 1)),
+                                       last.get("retaken_steps", 0), last.get("sar_found", 0), last.get("cp_found", 0)))
+                series.append(values)
+            with open(curve_path, "w", encoding="utf-8") as output:
+                output.write("step lidar_pct_mean lidar_pct_std cam_pct_mean cam_pct_std retaken_mean retaken_std sar_mean cp_mean\n")
+                for index in range(max_step):
+                    row = [values[index] for values in series if index < len(values)]
+                    cols = list(zip(*row)) if row else [[] for _ in range(5)]
+                    means = [statistics.mean(col) if col else 0.0 for col in cols]
+                    stds = [statistics.stdev(col) if len(col) > 1 else 0.0 for col in cols[:3]]
+                    output.write(f"{index + 1} {means[0]:.4f} {stds[0]:.4f} {means[1]:.4f} {stds[1]:.4f} {means[2]:.4f} {stds[2]:.4f} {means[3]:.4f} {means[4]:.4f}\n")
+
+            heatmap_path = os.path.join(data_dir, f"pgf_heatmap_{prefix}.dat")
+            with open(heatmap_path, "w", encoding="utf-8") as output:
+                output.write("x y visits\n")
+                for y in range(self.height):
+                    for x in range(self.width):
+                        index = y * self.width + x
+                        if self.grid[y][x] in (1, 3):
+                            value = "nan"
+                        else:
+                            visits = [record["heatmap"][index] for record in records if len(record["heatmap"]) > index]
+                            value = f"{statistics.mean(visits):.4f}" if visits else "0.0000"
+                        output.write(f"{x} {y} {value}\n")
+                    output.write("\n")
+
+            obstacle_path = os.path.join(data_dir, f"pgf_obstacles_{clean(self.current_map_name)}.dat")
+            with open(obstacle_path, "w", encoding="utf-8") as output:
+                output.write("x y\n")
+                for y in range(self.height):
+                    for x in range(self.width):
+                        if self.grid[y][x] in (1, 3): output.write(f"{x} {y}\n")
+
+            tex_path = os.path.join(data_dir, f"pgf_plots_{prefix}.tex")
+            with open(tex_path, "w", encoding="utf-8") as output:
+                output.write("% Requires pgfplots and patterns\n% \\usepackage{pgfplots}\n% \\usetikzlibrary{patterns}\n")
+                output.write("\\begin{tikzpicture}\n\\begin{axis}[title={LIDAR vs. Camera Coverage},xlabel={Steps},ylabel={Coverage (\\%)},legend pos=south east]\n")
+                output.write(f"\\addplot table[x=step,y=lidar_pct_mean] {{{os.path.basename(curve_path)}}};\\addlegendentry{{LIDAR}}\n")
+                output.write(f"\\addplot table[x=step,y=cam_pct_mean] {{{os.path.basename(curve_path)}}};\\addlegendentry{{Camera}}\n\\end{{axis}}\\end{{tikzpicture}}\n\n")
+                output.write("\\begin{tikzpicture}\n\\begin{axis}[title={Cumulative Retaken Steps},xlabel={Steps},ylabel={Retaken steps}]\n")
+                output.write(f"\\addplot table[x=step,y=retaken_mean] {{{os.path.basename(curve_path)}}};\n\\end{{axis}}\\end{{tikzpicture}}\n\n")
+                output.write(f"\\begin{{tikzpicture}}\\begin{{axis}}[title={{2D Visit Heatmap}},y dir=reverse,axis equal image,colorbar,point meta min=0,point meta max=5,xmin=-0.5,xmax={self.width - 0.5},ymin=-0.5,ymax={self.height - 0.5},colormap={{whiteRed}}{{color=(white) color=(red!60!white) color=(red!85!black)}},unbounded coords=jump]\n")
+                output.write(f"\\addplot[matrix plot*,point meta=explicit,mesh/cols={self.width},mesh/rows={self.height}] table[x=x,y=y,meta=visits] {{{os.path.basename(heatmap_path)}}};\n")
+                for y in range(self.height):
+                    for x in range(self.width):
+                        if self.grid[y][x] in (1, 3):
+                            output.write(f"\\draw[pattern=north east lines,pattern color=black,draw=black,line width=0.2pt] (axis cs:{x - 0.5},{y - 0.5}) rectangle (axis cs:{x + 0.5},{y + 0.5});\n")
+                output.write("\\end{axis}\n\\end{tikzpicture}\n\n")
+                output.write(f"\\begin{{tikzpicture}}\\begin{{axis}}[title={{3D Visit Surface}},point meta min=0,point meta max=5,zmin=0,colorbar,colormap={{whiteRed}}{{color=(white) color=(red!60!white) color=(red!85!black)}},unbounded coords=jump]\n")
+                output.write(f"\\addplot3[surf,shader=interp] table[x=x,y=y,z=visits] {{{os.path.basename(heatmap_path)}}};\n\\end{{axis}}\\end{{tikzpicture}}\n")
+
+    def _build_stdin(self):
+        flags = (int(self.sar_enabled.get()), int(self.sar_rtl.get()), int(self.cp_enabled.get()),
+                 int(self.cp_coords.get()), int(self.cp_rtl.get()))
+        text = f"{self.width} {self.height} {len(self.launch_positions)} {self.fov_slider.get()} {self.camera_fov_slider.get()} {' '.join(map(str, flags))}\n"
+        text += "".join(f"{x} {y}\n" for x, y in self.launch_positions)
+        text += "".join(" ".join(map(str, row)) + "\n" for row in self.grid)
+        return text
+
+    def run_batch(self):
+        if self.running:
+            return
+        try:
+            trials = max(1, int(self.trials_input.get()))
+        except ValueError:
+            trials = 1
+        self.set_benchmark_controls(tk.DISABLED)
+        threading.Thread(target=self._run_batch_worker, args=(trials,), daemon=True).start()
+
+    def _run_batch_worker(self, trials):
+        results = []
+        for trial in range(trials):
+            process = subprocess.run([os.path.join(BASE_DIR, "drone")], input=self._build_stdin(), text=True,
+                                     capture_output=True, check=False)
+            metrics = []
+            stats = None
+            heatmap = []
+            for line in process.stdout.splitlines():
+                if line.startswith("METRIC "):
+                    parts = line.split()
+                    if len(parts) == 8:
+                        step, lidar, camera, total, retaken, sar, cp = map(int, parts[1:])
+                        metrics.append({"step": step, "lidar_covered": lidar,
+                                        "camera_covered": camera, "total_reachable": total,
+                                        "retaken_steps": retaken,
+                                        "lidar_coverage_pct": 100.0 * lidar / max(1, total),
+                                        "camera_coverage_pct": 100.0 * camera / max(1, total),
+                                        "sar_found": sar, "cp_found": cp})
+                elif line.startswith("HEATMAP "):
+                    try:
+                        heatmap = list(map(int, line.split()[1:]))
+                    except ValueError:
+                        heatmap = []
+                elif line.startswith("STATS "):
+                    try:
+                        stats = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        pass
+            if stats:
+                run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{trial + 1}"
+                self._log_batch_result(run_id, stats, metrics)
+                results.append({"stats": stats, "metrics": metrics, "heatmap": heatmap})
+            self.root.after(0, self.benchmark_status.config, {"text": f"Batch: {trial + 1} / {trials} completed..."})
+        self.root.after(0, self._finish_batch, results)
+
+    def _log_batch_result(self, run_id, stats, metrics):
+        if not self.save_csv.get():
+            return
+        base = {"timestamp": datetime.now().isoformat(timespec="seconds"), "run_id": run_id,
+                "algorithm": self.algorithm_input.get(), "map_name": self.current_map_name,
+                "width": self.width, "height": self.height, "num_drones": len(self.launch_positions),
+                "fov": self.fov_slider.get(), "camera_fov": self.camera_fov_slider.get(),
+                "sar_enabled": int(self.sar_enabled.get()), "cp_enabled": int(self.cp_enabled.get()),
+                "cp_coords": int(self.cp_coords.get())}
+        self._csv_append("results_summary.csv", list(base) + list(stats), {**base, **stats})
+        fields = ["run_id", "algorithm", "map_name", "num_drones", "step", "lidar_covered",
+              "camera_covered", "total_reachable", "lidar_coverage_pct",
+              "camera_coverage_pct", "retaken_steps", "sar_found", "cp_found"]
+        for metric in metrics:
+            self._csv_append("results_curves.csv", fields,
+                             {"run_id": run_id, "algorithm": self.algorithm_input.get(),
+                              "map_name": self.current_map_name, "num_drones": len(self.launch_positions), **metric})
+
+    def _finish_batch(self, results):
+        self.set_benchmark_controls(tk.NORMAL)
+        if not results:
+            self.benchmark_status.config(text="Batch finished: no valid STATS")
+            return
+        stats_records = [record["stats"] for record in results]
+        batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        average = {}
+        for key in stats_records[0]:
+            values = [float(item[key]) for item in stats_records if isinstance(item.get(key), (int, float))]
+            if values:
+                valid = [value for value in values if not key.startswith("time_to_") or value >= 0]
+                average[key] = f"{statistics.mean(valid) if valid else -1:.4f}"
+        base = {"timestamp": datetime.now().isoformat(timespec="seconds"),
+                "run_id": f"BATCH_AVG_{batch_timestamp}", "algorithm": self.algorithm_input.get(),
+                "map_name": self.current_map_name, "width": self.width, "height": self.height,
+                "num_drones": len(self.launch_positions), "fov": self.fov_slider.get(),
+                "camera_fov": self.camera_fov_slider.get(), "sar_enabled": int(self.sar_enabled.get()),
+                "cp_enabled": int(self.cp_enabled.get()), "cp_coords": int(self.cp_coords.get()),
+                "status": "AVERAGE", **average}
+        if self.save_csv.get():
+            self._csv_append("results_summary.csv", list(base) + [key for key in stats_records[0] if key not in base], base)
+            self.export_pgfplots(results, batch_timestamp)
+
+        keys = ["exploration_steps", "total_steps", "coverage_pct", "camera_overlap_ratio",
+                "revisited_steps", "inter_drone_overlap_tiles", "total_swarm_distance",
+                "total_hovers", "tsdf_exposure_pct", "avg_planning_ms"]
+        lines = []
+        for key in keys:
+            values = [float(item["stats"][key]) for item in results if key in item["stats"]]
+            if values:
+                lines.append(f"{key}: {statistics.mean(values):.2f} +/- {statistics.stdev(values) if len(values) > 1 else 0.0:.2f}")
+        success = 100.0 * sum(item["stats"].get("status") == "DONE" for item in results) / len(results)
+        lines.append(f"success_rate: {success:.2f}%")
+        summary = "\n".join(lines)
+        self.benchmark_status.config(text=f"Batch complete: {len(results)} / {len(results)}")
+        print(summary)
+        messagebox.showinfo("Batch summary", summary)
+
     def process_queue(self):
         try:
             while True:
@@ -628,6 +970,12 @@ class DroneVisualizer:
                 elif msg_type == "SPARSE_PATHS":
                     drone_id, paths_list = data
                     self.sparse_plans[drone_id] = paths_list
+                elif msg_type == "METRIC":
+                    self.current_run_metrics.append(data)
+                elif msg_type == "STATS":
+                    self.last_run_stats = data
+                elif msg_type == "HEATMAP":
+                    self.last_run_heatmap = data
 
                 elif msg_type == "MOVE":
                     drone_id, new_x, new_y = data
@@ -653,7 +1001,12 @@ class DroneVisualizer:
                     self.start_btn.config(state=tk.NORMAL)
                     self.apply_btn.config(state=tk.NORMAL)
                     self.gen_btn.config(state=tk.NORMAL)
+                    self.set_benchmark_controls(tk.NORMAL)
                     self.running = False
+                    if self.last_run_stats:
+                        print(json.dumps(self.last_run_stats, indent=2, sort_keys=True))
+                        self.save_completed_run()
+                        messagebox.showinfo("Run summary", self.format_stats_summary())
                     return
                 elif msg_type == "PRINT":
                     print(f"[C++] {data}")
@@ -738,6 +1091,30 @@ class DroneVisualizer:
             if line.startswith("TSDF"):
                 coords = list(map(float, line.split()[1:]))
                 self.ui_queue.put(("TSDF", coords))
+                continue
+            if line.startswith("METRIC "):
+                parts = line.split()
+                if len(parts) == 8:
+                    step, lidar, camera, total, retaken, sar, cp = map(int, parts[1:])
+                    self.ui_queue.put(("METRIC", {
+                        "step": step, "lidar_covered": lidar, "camera_covered": camera,
+                        "total_reachable": total, "retaken_steps": retaken,
+                        "lidar_coverage_pct": 100.0 * lidar / max(1, total),
+                        "camera_coverage_pct": 100.0 * camera / max(1, total),
+                        "sar_found": sar, "cp_found": cp,
+                    }))
+                continue
+            if line.startswith("HEATMAP "):
+                try:
+                    self.ui_queue.put(("HEATMAP", list(map(int, line.split()[1:]))))
+                except ValueError:
+                    self.ui_queue.put(("PRINT", line))
+                continue
+            if line.startswith("STATS "):
+                try:
+                    self.ui_queue.put(("STATS", json.loads(line[6:])))
+                except json.JSONDecodeError:
+                    self.ui_queue.put(("PRINT", line))
                 continue
             if line.startswith("MOVE"):
                 parts = line.split()
